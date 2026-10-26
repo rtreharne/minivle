@@ -1,0 +1,1 @@
+{% extends 'core/base.html' %}{% block content %}<section class="auth-shell"><div class="auth-card"><p class="kicker">Verification</p><h1>Resend your link.</h1><form method="post">{% csrf_token %}<label>Email address<input type="email" name="email" required></label><button class="primary-btn">Send verification link</button></form></div></section>{% endblock %}

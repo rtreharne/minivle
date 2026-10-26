@@ -1,0 +1,41 @@
+services:
+  web:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      DEBUG: "true"
+      SECRET_KEY: change-this-before-production
+      POSTGRES_HOST: db
+      POSTGRES_DB: minivle
+      POSTGRES_USER: minivle
+      POSTGRES_PASSWORD: minivle
+      AWS_STORAGE_BUCKET_NAME: minivle
+      AWS_S3_ENDPOINT_URL: http://objectstore:8333
+      AWS_ACCESS_KEY_ID: minivle
+      AWS_SECRET_ACCESS_KEY: minivle-local-only
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+      objectstore: {condition: service_started}
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: minivle
+      POSTGRES_USER: minivle
+      POSTGRES_PASSWORD: minivle
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U minivle -d minivle"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+  objectstore:
+    image: chrislusf/seaweedfs:latest
+    command: server -s3 -dir=/data
+    ports: ["8333:8333"]
+    volumes: [objectstore_data:/data]
+volumes:
+  postgres_data:
+  objectstore_data:
