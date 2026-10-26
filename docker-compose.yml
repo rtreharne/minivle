@@ -4,6 +4,7 @@ services:
     ports: ["8000:8000"]
     environment:
       DEBUG: "true"
+      ALLOWED_HOSTS: localhost,127.0.0.1,host.docker.internal,testserver
       SECRET_KEY: change-this-before-production
       POSTGRES_HOST: db
       POSTGRES_DB: minivle
@@ -13,10 +14,15 @@ services:
       AWS_S3_ENDPOINT_URL: http://objectstore:8333
       AWS_ACCESS_KEY_ID: minivle
       AWS_SECRET_ACCESS_KEY: minivle-local-only
+      LTI_PRIVATE_KEY_FILE: /run/secrets/lti_private_key
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_started}
       objectstore: {condition: service_started}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./secrets/lti-development-private.pem:/run/secrets/lti_private_key:ro
   db:
     image: postgres:16-alpine
     environment:

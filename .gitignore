@@ -1,7 +1,1 @@
-__pycache__/
-*.py[cod]
-db.sqlite3
-staticfiles/
-.env
-.venv/
-media/
+secrets/

@@ -1,4 +1,7 @@
+import json
+import secrets
 from datetime import timedelta
+from urllib.request import urlopen
 from django.contrib import messages
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required, user_passes_test
@@ -9,8 +12,8 @@ from django.http import Http404
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from .api import audit
-from .forms import AssignmentForm, CourseForm, GradeForm, LtiToolForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
-from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiTool, Submission, ToolPlacement
+from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiRegistrationForm, LtiToolForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
+from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
 from .permissions import can_manage, course_role, enrolled_or_404, is_platform_admin, student_preview_active
 
 platform_admin_required = user_passes_test(is_platform_admin, login_url="dashboard")
@@ -135,6 +138,15 @@ def course_home(request, course_id):
     return render(request, "core/course_home.html", {"course": course, "assignments": course.assignments.filter(published=True)[:5], "can_manage": can_manage(request.user, course), "preview": student_preview_active(request, course)})
 
 @login_required
+def course_tool(request, course_id, placement_id):
+    """Keep an LTI 1.3 navigation placement within the course content canvas."""
+    course = enrolled_or_404(request.user, get_object_or_404(Course, pk=course_id))
+    placement = get_object_or_404(ToolPlacement.objects.select_related("tool"), pk=placement_id, course=course, tool__lti_version="1.3")
+    if not placement.tool.active or not LtiDeployment.objects.filter(tool=placement.tool, course=course, active=True).exists():
+        raise Http404
+    return render(request, "core/course_tool.html", {"course": course, "placement": placement})
+
+@login_required
 def toggle_student_preview(request, course_id):
     course = enrolled_or_404(request.user, get_object_or_404(Course, pk=course_id))
     if not can_manage(request.user, course): raise Http404
@@ -228,7 +240,11 @@ def lti_tools(request, course_id):
             tool_form, placement_form = LtiToolForm(), ToolPlacementForm(request.POST)
             placement_form.fields["assignment"].queryset = course.assignments.all()
             if placement_form.is_valid():
-                placement = placement_form.save(commit=False); placement.course = course; placement.save()
+                placement = placement_form.save(commit=False); placement.course = course
+                if placement.tool.lti_version == "1.3" and not LtiDeployment.objects.filter(tool=placement.tool, course=course, active=True).exists():
+                    placement_form.add_error("tool", "This LTI 1.3 registration must be deployed to the course by a platform administrator first.")
+                    return render(request, "core/lti_tools.html", {"course": course, "placements": course.tool_placements.select_related("tool"), "tools": LtiTool.objects.all(), "can_manage": manager, "tool_form": tool_form, "placement_form": placement_form})
+                placement.save()
                 audit(request, "lti.placement_created", str(placement.id)); messages.success(request, "Tool added to course."); return redirect(request.path)
     else:
         tool_form, placement_form = LtiToolForm(), ToolPlacementForm()
@@ -238,6 +254,62 @@ def lti_tools(request, course_id):
 @platform_admin_required
 def platform_dashboard(request):
     return render(request, "core/platform/dashboard.html", {"people_count": User.objects.count(), "course_count": Course.objects.count(), "tool_count": LtiTool.objects.count(), "pending_count": User.objects.filter(is_active=False).count(), "events": AuditEvent.objects.select_related("actor")[:8]})
+
+@platform_admin_required
+def platform_lti(request):
+    registration_form, import_form = LtiRegistrationForm(), LtiConfigImportForm()
+    if request.method == "POST":
+        action = request.POST.get("action")
+        if action == "manual":
+            registration_form = LtiRegistrationForm(request.POST)
+            if registration_form.is_valid():
+                tool = registration_form.save(commit=False)
+                tool.lti_version, tool.client_id, tool.created_by, tool.active = "1.3", f"minivle-{secrets.token_urlsafe(18)}", request.user, True
+                tool.save(); audit(request, "lti13.registration_created", str(tool.id), client_id=tool.client_id)
+                messages.success(request, "LTI 1.3 registration created.")
+                return redirect("platform-lti-detail", tool_id=tool.id)
+        elif action == "import":
+            import_form = LtiConfigImportForm(request.POST)
+            if import_form.is_valid():
+                try:
+                    with urlopen(import_form.cleaned_data["config_url"], timeout=5) as response:
+                        config = json.load(response)
+                    required = ("title", "oidc_initiation_url", "target_link_uri", "public_jwk_url")
+                    if any(not config.get(field) for field in required): raise ValueError("Configuration is missing one or more required LTI 1.3 fields.")
+                    tool = LtiTool.objects.create(
+                        name=config["title"], launch_url=config["target_link_uri"], oidc_initiation_url=config["oidc_initiation_url"],
+                        jwks_url=config["public_jwk_url"], scopes=config.get("scopes", []), lti_version="1.3",
+                        client_id=f"minivle-{secrets.token_urlsafe(18)}", created_by=request.user, active=True,
+                    )
+                    audit(request, "lti13.registration_imported", str(tool.id), source=import_form.cleaned_data["config_url"], client_id=tool.client_id)
+                    messages.success(request, "LTI 1.3 configuration imported.")
+                    return redirect("platform-lti-detail", tool_id=tool.id)
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    import_form.add_error("config_url", f"Could not import configuration: {error}")
+    return render(request, "core/platform/lti.html", {"tools": LtiTool.objects.filter(lti_version="1.3").prefetch_related("deployments"), "registration_form": registration_form, "import_form": import_form})
+
+@platform_admin_required
+def platform_lti_detail(request, tool_id):
+    tool = get_object_or_404(LtiTool, pk=tool_id, lti_version="1.3")
+    deployment_form = LtiDeploymentForm()
+    if request.method == "POST":
+        if request.POST.get("action") == "toggle":
+            tool.active = not tool.active; tool.save(update_fields=["active", "updated_at"])
+            audit(request, "lti13.registration_toggled", str(tool.id), active=tool.active)
+            return redirect(request.path)
+        deployment_form = LtiDeploymentForm(request.POST)
+        if deployment_form.is_valid():
+            deployment, created = LtiDeployment.objects.get_or_create(
+                tool=tool, course=deployment_form.cleaned_data["course"],
+                defaults={"deployment_id": f"dep-{secrets.token_urlsafe(18)}", "active": deployment_form.cleaned_data["active"]},
+            )
+            if not created:
+                deployment.active = deployment_form.cleaned_data["active"]; deployment.save(update_fields=["active", "updated_at"])
+            audit(request, "lti13.deployment_created", str(deployment.id), course=deployment.course_id, deployment_id=deployment.deployment_id)
+            messages.success(request, "LTI deployment is ready. Add a course placement from the course LTI tools page.")
+            return redirect(request.path)
+    deployment_form.fields["course"].queryset = Course.objects.filter(is_archived=False)
+    return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form})
 
 @platform_admin_required
 def platform_people(request):

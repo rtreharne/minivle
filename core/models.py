@@ -67,6 +67,9 @@ class LtiTool(Timestamped):
     client_id = models.CharField(max_length=255, blank=True)
     deployment_id = models.CharField(max_length=255, blank=True)
     jwks_url = models.URLField(blank=True)
+    oidc_initiation_url = models.URLField(blank=True)
+    scopes = models.JSONField(default=list, blank=True)
+    active = models.BooleanField(default=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     def __str__(self): return self.name
 
@@ -75,6 +78,14 @@ class ToolPlacement(Timestamped):
     tool = models.ForeignKey(LtiTool, on_delete=models.CASCADE, related_name="placements")
     title = models.CharField(max_length=120)
     assignment = models.ForeignKey(Assignment, null=True, blank=True, on_delete=models.SET_NULL)
+
+class LtiDeployment(Timestamped):
+    tool = models.ForeignKey(LtiTool, on_delete=models.CASCADE, related_name="deployments")
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name="lti_deployments")
+    deployment_id = models.CharField(max_length=255, unique=True)
+    active = models.BooleanField(default=True)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["tool", "course"], name="unique_lti_tool_course_deployment")]
 
 class AuditEvent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

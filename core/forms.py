@@ -1,7 +1,7 @@
 from django import forms
 from django.contrib.auth.models import User
 from django.contrib.auth.forms import UserCreationForm
-from .models import Assignment, Course, Grade, LtiTool, Submission, ToolPlacement
+from .models import Assignment, Course, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
 
 class RegistrationForm(UserCreationForm):
     email = forms.EmailField()
@@ -51,3 +51,20 @@ class ToolPlacementForm(forms.ModelForm):
     class Meta:
         model = ToolPlacement
         fields = ["tool", "title", "assignment"]
+
+class LtiRegistrationForm(forms.ModelForm):
+    scopes = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 3, "placeholder": "One scope per line"}))
+    class Meta:
+        model = LtiTool
+        fields = ["name", "launch_url", "oidc_initiation_url", "jwks_url", "scopes"]
+    def clean_scopes(self):
+        value = self.cleaned_data["scopes"]
+        return [item.strip() for item in value.splitlines() if item.strip()]
+
+class LtiConfigImportForm(forms.Form):
+    config_url = forms.URLField(label="Tool configuration URL")
+
+class LtiDeploymentForm(forms.ModelForm):
+    class Meta:
+        model = LtiDeployment
+        fields = ["course", "active"]

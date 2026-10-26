@@ -3,7 +3,8 @@ from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.urls import reverse
-from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiTool, Submission, ToolPlacement
+from urllib.parse import parse_qs, urlparse
+from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
 
 class LearningWorkflowTests(TestCase):
     def setUp(self):
@@ -113,3 +114,27 @@ class LearningWorkflowTests(TestCase):
         self.assertContains(response, reverse("lti-jwks"))
         self.assertContains(response, reverse("lti-oidc-login"))
         self.assertContains(response, reverse("lti13-launch"))
+
+    def test_lti13_course_placement_creates_a_signed_resource_link_launch(self):
+        tool = LtiTool.objects.create(name="Counter", launch_url="http://localhost:8002/lti/launch", oidc_initiation_url="http://localhost:8002/oidc/login", jwks_url="http://localhost:8002/.well-known/jwks.json", lti_version="1.3", client_id="counter-client", active=True)
+        LtiDeployment.objects.create(tool=tool, course=self.course, deployment_id="counter-deployment")
+        placement = ToolPlacement.objects.create(course=self.course, tool=tool, title="Counter")
+        self.client.login(username="learner", password="pass")
+        response = self.client.get(reverse("lti13-start", args=[placement.id]))
+        self.assertEqual(response.status_code, 302)
+        query = parse_qs(urlparse(response["Location"]).query)
+        self.assertEqual(query["client_id"], ["counter-client"])
+        response = self.client.get(reverse("lti13-authorize"), {"client_id": "counter-client", "redirect_uri": tool.launch_url, "state": "state", "nonce": "nonce", "lti_message_hint": query["lti_message_hint"][0]})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "id_token")
+        self.assertTrue(AuditEvent.objects.filter(action="lti13.launch", target=str(tool.id)).exists())
+
+    def test_lti13_placement_is_available_inside_the_course_canvas(self):
+        tool = LtiTool.objects.create(name="Counter", launch_url="http://localhost:8002/lti/launch", oidc_initiation_url="http://localhost:8002/oidc/login", jwks_url="http://localhost:8002/.well-known/jwks.json", lti_version="1.3", client_id="counter-embedded", active=True)
+        LtiDeployment.objects.create(tool=tool, course=self.course, deployment_id="counter-embedded-deployment")
+        placement = ToolPlacement.objects.create(course=self.course, tool=tool, title="Counter")
+        self.client.login(username="learner", password="pass")
+        response = self.client.get(reverse("course-tool", args=[self.course.id, placement.id]))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "lti-tool-frame")
+        self.assertContains(response, reverse("lti13-start", args=[placement.id]))

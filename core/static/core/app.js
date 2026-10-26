@@ -37,4 +37,31 @@
       localStorage.setItem(clicksKey, JSON.stringify(clicks));
     }));
   }
+
+  const rosterTable = document.querySelector('[data-roster-table]');
+  const rosterSearch = document.querySelector('[data-roster-search]');
+  const rosterCount = document.querySelector('[data-roster-count]');
+  if (rosterTable) {
+    const body = rosterTable.tBodies[0];
+    const rows = () => Array.from(body.querySelectorAll('[data-roster-row]'));
+    const updateCount = () => {
+      if (!rosterCount) return;
+      const visible = rows().filter((row) => !row.hidden).length;
+      rosterCount.textContent = `${visible} ${visible === 1 ? 'person' : 'people'}`;
+    };
+    rosterSearch?.addEventListener('input', () => {
+      const fragment = rosterSearch.value.trim().toLocaleLowerCase();
+      rows().forEach((row) => { row.hidden = Boolean(fragment) && !row.dataset.name.toLocaleLowerCase().includes(fragment); });
+      updateCount();
+    });
+    rosterTable.querySelectorAll('[data-roster-sort]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const key = button.dataset.rosterSort;
+        const direction = button.getAttribute('aria-sort') === 'ascending' ? -1 : 1;
+        rows().sort((a, b) => direction * a.dataset[key].localeCompare(b.dataset[key], undefined, { sensitivity: 'base' })).forEach((row) => body.append(row));
+        rosterTable.querySelectorAll('[data-roster-sort]').forEach((item) => item.setAttribute('aria-sort', item === button ? (direction === 1 ? 'ascending' : 'descending') : 'none'));
+      });
+    });
+    updateCount();
+  }
 })();

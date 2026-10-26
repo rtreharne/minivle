@@ -45,4 +45,14 @@ OAUTH2_PROVIDER = {"SCOPES": {"read": "Read LMS data", "write": "Manage LMS data
 # In production store the PEM in a secret manager, never in this repository.
 LTI_ISSUER = os.getenv("LTI_ISSUER", "http://localhost:8000")
 LTI_PRIVATE_KEY = os.getenv("LTI_PRIVATE_KEY", "")
+if not LTI_PRIVATE_KEY and os.getenv("LTI_PRIVATE_KEY_FILE"):
+    LTI_PRIVATE_KEY = Path(os.environ["LTI_PRIVATE_KEY_FILE"]).read_text()
+if not LTI_PRIVATE_KEY and DEBUG:
+    # An ephemeral key makes the local test platform usable without placing a
+    # private key in source control. Production must always provide a key.
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    LTI_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+    ).decode()
 LTI_KEY_ID = os.getenv("LTI_KEY_ID", "minivle-development-key")

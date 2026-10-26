@@ -1,16 +1,43 @@
 """LTI platform endpoints. Production deployments must set LTI_PRIVATE_KEY and enforce HTTPS."""
 import json, time, uuid
+from urllib.request import urlopen
 from urllib.parse import parse_qs, urlencode
 import jwt
 from django.conf import settings
+from django.contrib.auth.decorators import login_required
+from django.core import signing
 from django.http import HttpResponseBadRequest, JsonResponse
-from django.shortcuts import get_object_or_404, render
+from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.clickjacking import xframe_options_exempt
+from django.views.decorators.csrf import csrf_exempt
 from oauthlib.oauth1 import Client, SIGNATURE_TYPE_BODY, RequestValidator, SignatureOnlyEndpoint
 from oauth2_provider.decorators import protected_resource
 from .api import audit
-from .models import AuditEvent, Grade, LtiTool, ToolPlacement
-from .permissions import course_role
+from .models import AuditEvent, Grade, LtiDeployment, LtiTool, ToolPlacement
+from .permissions import can_manage, course_role
+
+LTI_VERSION = "https://purl.imsglobal.org/spec/lti/claim/version"
+LTI_DEPLOYMENT = "https://purl.imsglobal.org/spec/lti/claim/deployment_id"
+LTI_MESSAGE_TYPE = "https://purl.imsglobal.org/spec/lti/claim/message_type"
+LTI_CONTEXT = "https://purl.imsglobal.org/spec/lti/claim/context"
+LTI_DEEP_LINKING = "https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings"
+LTI_CONTENT_ITEMS = "https://purl.imsglobal.org/spec/lti-dl/claim/content_items"
+
+def lti13_hint(payload):
+    return signing.dumps(payload, salt="lti13-launch")
+
+def signed_platform_token(tool, deployment, course, user, nonce, message_type, **claims):
+    now = int(time.time())
+    base = {
+        "iss": settings.LTI_ISSUER, "aud": tool.client_id, "sub": str(user.pk), "iat": now, "exp": now + 300, "nonce": nonce,
+        LTI_VERSION: "1.3.0", LTI_DEPLOYMENT: deployment.deployment_id, LTI_MESSAGE_TYPE: message_type,
+        LTI_CONTEXT: {"id": str(course.id), "label": course.code, "title": course.title},
+        "https://purl.imsglobal.org/spec/lti/claim/roles": ["http://purl.imsglobal.org/vocab/lis/v2/membership#" + ("Instructor" if course_role(user, course) in ("instructor", "admin") else "Learner")],
+        "name": user.get_full_name() or user.username, "email": user.email,
+    }
+    base.update(claims)
+    return jwt.encode(base, settings.LTI_PRIVATE_KEY, algorithm="RS256", headers={"kid": settings.LTI_KEY_ID})
 
 class ToolValidator(RequestValidator):
     enforce_ssl = False
@@ -64,6 +91,91 @@ def jwks(request):
     key = serialization.load_pem_private_key(settings.LTI_PRIVATE_KEY.encode(), password=None).public_key()
     data = json.loads(RSAAlgorithm.to_jwk(key)); data.update({"kid": settings.LTI_KEY_ID, "use": "sig", "alg": "RS256"})
     return JsonResponse({"keys": [data]})
+
+@login_required
+@require_GET
+@xframe_options_exempt
+def lti13_start(request, placement_id):
+    """Begin a standards-shaped third-party initiated OIDC launch."""
+    placement = get_object_or_404(ToolPlacement.objects.select_related("tool", "course"), pk=placement_id, tool__lti_version="1.3")
+    tool = placement.tool
+    deployment = LtiDeployment.objects.filter(tool=tool, course=placement.course, active=True).first()
+    if not course_role(request.user, placement.course) or not tool.active or not deployment or not tool.oidc_initiation_url:
+        return HttpResponseBadRequest("This LTI 1.3 placement is not available.")
+    hint = lti13_hint({"kind": "resource_link", "placement_id": placement.id, "user_id": request.user.id})
+    params = {
+        "iss": settings.LTI_ISSUER, "client_id": tool.client_id,
+        "login_hint": str(request.user.id), "target_link_uri": tool.launch_url,
+        "lti_message_hint": hint,
+    }
+    audit(request, "lti13.login_initiated", str(tool.id), course=placement.course_id, deployment=deployment.deployment_id)
+    return redirect(tool.oidc_initiation_url + ("&" if "?" in tool.oidc_initiation_url else "?") + urlencode(params))
+
+@login_required
+@require_GET
+@xframe_options_exempt
+def lti13_deep_link_start(request, course_id, tool_id):
+    """Start an instructor-only LTI Deep Linking request for one deployed tool."""
+    course = get_object_or_404(LtiDeployment.objects.select_related("course"), course_id=course_id, tool_id=tool_id, active=True).course
+    tool = get_object_or_404(LtiTool, pk=tool_id, lti_version="1.3", active=True)
+    deployment = get_object_or_404(LtiDeployment, course=course, tool=tool, active=True)
+    if not can_manage(request.user, course) or not tool.oidc_initiation_url:
+        return HttpResponseBadRequest("Only course instructors can add LTI content.")
+    hint = lti13_hint({"kind": "deep_linking", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id})
+    params = {"iss": settings.LTI_ISSUER, "client_id": tool.client_id, "login_hint": str(request.user.id), "target_link_uri": tool.launch_url, "lti_message_hint": hint}
+    audit(request, "lti13.deep_linking_initiated", str(tool.id), course=course.id, deployment=deployment.deployment_id)
+    return redirect(tool.oidc_initiation_url + ("&" if "?" in tool.oidc_initiation_url else "?") + urlencode(params))
+
+@login_required
+@require_GET
+@xframe_options_exempt
+def lti13_authorize(request):
+    """Return a signed LTI Resource Link or Deep Linking id_token to a registered tool."""
+    client_id, redirect_uri = request.GET.get("client_id", ""), request.GET.get("redirect_uri", "")
+    tool = LtiTool.objects.filter(lti_version="1.3", client_id=client_id, active=True).first()
+    if not tool or redirect_uri != tool.launch_url or not settings.LTI_PRIVATE_KEY:
+        return HttpResponseBadRequest("Unknown LTI client or redirect URI.")
+    try:
+        hint = signing.loads(request.GET.get("lti_message_hint", ""), salt="lti13-launch", max_age=300)
+    except signing.BadSignature:
+        return HttpResponseBadRequest("Invalid or expired LTI launch hint.")
+    if hint.get("user_id") != request.user.id:
+        return HttpResponseBadRequest("The LTI launch does not belong to this user.")
+    kind = hint.get("kind", "resource_link")
+    placement = None
+    if kind == "resource_link":
+        placement = ToolPlacement.objects.select_related("course").filter(pk=hint.get("placement_id"), tool=tool).first()
+        course = placement and placement.course
+        permitted = course and course_role(request.user, course)
+    elif kind == "deep_linking":
+        course = get_object_or_404(LtiDeployment, course_id=hint.get("course_id"), tool=tool, active=True).course
+        permitted = can_manage(request.user, course)
+    else:
+        return HttpResponseBadRequest("Unsupported LTI launch type.")
+    deployment = course and LtiDeployment.objects.filter(tool=tool, course=course, active=True).first()
+    if not deployment or not permitted:
+        return HttpResponseBadRequest("This LTI deployment is unavailable.")
+    nonce, state = request.GET.get("nonce", ""), request.GET.get("state", "")
+    if not nonce or not state:
+        return HttpResponseBadRequest("LTI state and nonce are required.")
+    if kind == "deep_linking":
+        data = lti13_hint({"kind": "deep_linking_response", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id})
+        token = signed_platform_token(tool, deployment, course, request.user, nonce, "LtiDeepLinkingRequest", **{
+            "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": tool.launch_url,
+            LTI_DEEP_LINKING: {
+                "deep_link_return_url": request.build_absolute_uri("/lti/deep-linking/return/"),
+                "accept_types": ["ltiResourceLink"], "accept_presentation_document_targets": ["iframe", "window"],
+                "accept_media_types": "*/*", "auto_create": False, "data": data,
+            },
+        })
+        audit(request, "lti13.deep_linking_launch", str(tool.id), course=course.id, deployment=deployment.deployment_id)
+    else:
+        token = signed_platform_token(tool, deployment, course, request.user, nonce, "LtiResourceLinkRequest", **{
+            "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": tool.launch_url,
+            "https://purl.imsglobal.org/spec/lti/claim/resource_link": {"id": f"placement-{placement.id}", "title": placement.title},
+        })
+        audit(request, "lti13.launch", str(tool.id), course=course.id, deployment=deployment.deployment_id)
+    return render(request, "core/lti_post.html", {"target": redirect_uri, "id_token": token, "state": state})
 
 @require_GET
 def oidc_login(request):
