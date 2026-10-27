@@ -1,7 +1,10 @@
 import json
 import secrets
+import hashlib
+import hmac
 from datetime import timedelta
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required, user_passes_test
@@ -10,13 +13,27 @@ from django.core.mail import send_mail
 from django.db.models import Max, Q
 from django.http import Http404
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from .api import audit
-from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiRegistrationForm, LtiToolForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
+from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiRegistrationForm, LtiToolForm, PlacementConfigurationForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
 from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
 from .permissions import can_manage, course_role, enrolled_or_404, is_platform_admin, student_preview_active
 
 platform_admin_required = user_passes_test(is_platform_admin, login_url="dashboard")
+
+def sync_tool_deployment(tool, deployment):
+    """Register a deployment with a tool's opted-in, signed management endpoint."""
+    if not tool.deployment_registration_url:
+        return
+    if not settings.LTI_DEPLOYMENT_SYNC_SECRET:
+        raise ValueError("Deployment sync is not configured on this MiniVLE instance.")
+    payload = json.dumps({"issuer": settings.LTI_ISSUER, "client_id": tool.client_id, "deployment_id": deployment.deployment_id}, separators=(",", ":")).encode()
+    signature = hmac.new(settings.LTI_DEPLOYMENT_SYNC_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    request = Request(tool.deployment_registration_url, data=payload, method="POST", headers={"Content-Type": "application/json", "X-MiniVLE-Deployment-Signature": signature})
+    with urlopen(request, timeout=5) as response:
+        if response.status not in (200, 201, 204):
+            raise ValueError("The tool rejected deployment registration.")
 
 def send_verification(request, user):
     token = EmailVerificationToken.objects.create(user=user, expires_at=timezone.now() + timedelta(hours=24))
@@ -171,12 +188,15 @@ def assignments(request, course_id):
     course = enrolled_or_404(request.user, get_object_or_404(Course, pk=course_id))
     if request.method == "POST":
         if not can_manage(request.user, course) or student_preview_active(request, course): raise Http404
-        form = AssignmentForm(request.POST)
+        form = AssignmentForm(request.POST, course=course)
         if form.is_valid():
+            tool = form.cleaned_data.get("lti_tool")
             assignment = form.save(commit=False); assignment.course = course; assignment.save()
             audit(request, "assignment.created", str(assignment.id)); messages.success(request, "Assignment published to your workspace.")
+            if assignment.submission_type == Assignment.SubmissionType.LTI_TOOL:
+                return redirect(f"{reverse('lti13-deep-link-start', args=[course.id, tool.id])}?assignment={assignment.id}")
             return redirect("assignments", course_id=course.id)
-    else: form = AssignmentForm()
+    else: form = AssignmentForm(course=course)
     return render(request, "core/assignments.html", {"course": course, "assignments": course.assignments.all(), "form": form, "can_manage": can_manage(request.user, course) and not student_preview_active(request, course)})
 
 @login_required
@@ -195,7 +215,8 @@ def assignment_detail(request, course_id, assignment_id):
     else: form = SubmissionForm()
     submissions = assignment.submissions.filter(student=request.user) if not manager else assignment.submissions.select_related("student")
     grade = Grade.objects.filter(assignment=assignment, student=request.user).first()
-    return render(request, "core/assignment_detail.html", {"course": course, "assignment": assignment, "form": form, "submissions": submissions, "grade": grade, "can_manage": manager, "preview": preview})
+    lti_placement = ToolPlacement.objects.filter(course=course, assignment=assignment, tool__lti_version="1.3", tool__active=True).first()
+    return render(request, "core/assignment_detail.html", {"course": course, "assignment": assignment, "form": form, "submissions": submissions, "grade": grade, "can_manage": manager, "preview": preview, "lti_placement": lti_placement})
 
 @login_required
 def grades(request, course_id):
@@ -231,6 +252,13 @@ def lti_tools(request, course_id):
     manager = can_manage(request.user, course) and not student_preview_active(request, course)
     if request.method == "POST" and manager:
         action = request.POST.get("action")
+        if action == "remove-placement":
+            placement = get_object_or_404(ToolPlacement, pk=request.POST.get("placement_id"), course=course)
+            title, placement_id = placement.title, placement.id
+            placement.delete()
+            audit(request, "lti.placement_removed", str(placement_id), course=course.id)
+            messages.success(request, f"Removed {title} from this course.")
+            return redirect(request.path)
         if action == "register":
             tool_form, placement_form = LtiToolForm(request.POST), ToolPlacementForm()
             if tool_form.is_valid():
@@ -249,7 +277,31 @@ def lti_tools(request, course_id):
     else:
         tool_form, placement_form = LtiToolForm(), ToolPlacementForm()
         placement_form.fields["assignment"].queryset = course.assignments.all()
-    return render(request, "core/lti_tools.html", {"course": course, "placements": course.tool_placements.select_related("tool"), "tools": LtiTool.objects.all() if manager else [], "can_manage": manager, "tool_form": tool_form, "placement_form": placement_form})
+    deep_link_tools = LtiTool.objects.filter(lti_version="1.3", active=True, deployments__course=course, deployments__active=True).distinct() if manager else []
+    return render(request, "core/lti_tools.html", {"course": course, "placements": course.tool_placements.select_related("tool"), "tools": LtiTool.objects.all() if manager else [], "deep_link_tools": deep_link_tools, "can_manage": manager, "tool_form": tool_form, "placement_form": placement_form})
+
+@login_required
+def configure_lti_placement(request, course_id, placement_id):
+    course = enrolled_or_404(request.user, get_object_or_404(Course, pk=course_id))
+    if not can_manage(request.user, course) or student_preview_active(request, course):
+        raise Http404
+    placement = get_object_or_404(ToolPlacement.objects.select_related("tool"), pk=placement_id, course=course)
+    form = PlacementConfigurationForm(request.POST or None, instance=placement)
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        audit(request, "lti.placement_configured", str(placement.id), course=course.id, visible=placement.visible_in_course_navigation)
+        messages.success(request, f"Updated {placement.title}.")
+        return redirect("lti-tools", course_id=course.id)
+    return render(request, "core/lti_placement_configure.html", {"course": course, "placement": placement, "form": form})
+
+@login_required
+def add_lti_tool(request, course_id):
+    """Choose a registered, deployed tool before starting its content-selection flow."""
+    course = enrolled_or_404(request.user, get_object_or_404(Course, pk=course_id))
+    if not can_manage(request.user, course) or student_preview_active(request, course):
+        raise Http404
+    tools = LtiTool.objects.filter(lti_version="1.3", active=True, deployments__course=course, deployments__active=True).distinct()
+    return render(request, "core/lti_tool_picker.html", {"course": course, "tools": tools})
 
 @platform_admin_required
 def platform_dashboard(request):
@@ -278,7 +330,7 @@ def platform_lti(request):
                     if any(not config.get(field) for field in required): raise ValueError("Configuration is missing one or more required LTI 1.3 fields.")
                     tool = LtiTool.objects.create(
                         name=config["title"], launch_url=config["target_link_uri"], oidc_initiation_url=config["oidc_initiation_url"],
-                        jwks_url=config["public_jwk_url"], scopes=config.get("scopes", []), lti_version="1.3",
+                        jwks_url=config["public_jwk_url"], deployment_registration_url=config.get("minivle_deployment_registration_url", ""), scopes=config.get("scopes", []), lti_version="1.3",
                         client_id=f"minivle-{secrets.token_urlsafe(18)}", created_by=request.user, active=True,
                     )
                     audit(request, "lti13.registration_imported", str(tool.id), source=import_form.cleaned_data["config_url"], client_id=tool.client_id)
@@ -305,6 +357,12 @@ def platform_lti_detail(request, tool_id):
             )
             if not created:
                 deployment.active = deployment_form.cleaned_data["active"]; deployment.save(update_fields=["active", "updated_at"])
+            try:
+                sync_tool_deployment(tool, deployment)
+            except (OSError, ValueError) as error:
+                if created: deployment.delete()
+                deployment_form.add_error(None, f"Could not register this deployment with the tool: {error}")
+                return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form})
             audit(request, "lti13.deployment_created", str(deployment.id), course=deployment.course_id, deployment_id=deployment.deployment_id)
             messages.success(request, "LTI deployment is ready. Add a course placement from the course LTI tools page.")
             return redirect(request.path)

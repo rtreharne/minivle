@@ -1,0 +1,6 @@
+{% extends 'core/base.html' %}
+{% block content %}
+<a class="back-link" href="{% url 'lti-tools' course.id %}">← Tools</a>
+<div class="page-title"><p class="kicker">Course tools</p><h1>Add a tool</h1><p>Select a tool deployed to {{ course.code }}. You will then choose its course content.</p></div>
+<section class="panel tool-picker">{% for tool in tools %}<div class="list-row"><span><strong>{{ tool.name }}</strong><small>LTI 1.3 · configured for this course</small></span><a class="button" href="{% url 'lti13-deep-link-start' course.id tool.id %}">Select tool</a></div>{% empty %}<p class="empty">No LTI 1.3 tools are deployed to this course. A platform administrator must deploy a tool before it can be added here.</p>{% endfor %}</section>
+{% endblock %}

@@ -1,0 +1,6 @@
+{% extends 'core/base.html' %}
+{% block content %}
+<a class="back-link" href="{% url 'lti-tools' course.id %}">← Tools</a>
+<div class="page-title"><p class="kicker">Course placement</p><h1>Configure {{ placement.title }}</h1><p>{{ placement.tool.name }} · LTI {{ placement.tool.lti_version }}</p></div>
+<section class="panel placement-configure"><p class="muted">Control where this existing placement is shown. Tool content and Deep Linking settings are managed by the tool.</p><form method="post">{% csrf_token %}{{ form.as_p }}<div class="inline-actions"><button class="button">Save changes</button><a class="secondary-btn" href="{% url 'lti-tools' course.id %}">Cancel</a></div></form></section>
+{% endblock %}

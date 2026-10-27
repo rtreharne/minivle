@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlencode
 import jwt
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth import get_user_model
 from django.core import signing
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -14,7 +15,7 @@ from django.views.decorators.csrf import csrf_exempt
 from oauthlib.oauth1 import Client, SIGNATURE_TYPE_BODY, RequestValidator, SignatureOnlyEndpoint
 from oauth2_provider.decorators import protected_resource
 from .api import audit
-from .models import AuditEvent, Grade, LtiDeployment, LtiTool, ToolPlacement
+from .models import Assignment, AuditEvent, Grade, LtiDeployment, LtiTool, ToolPlacement
 from .permissions import can_manage, course_role
 
 LTI_VERSION = "https://purl.imsglobal.org/spec/lti/claim/version"
@@ -121,7 +122,10 @@ def lti13_deep_link_start(request, course_id, tool_id):
     deployment = get_object_or_404(LtiDeployment, course=course, tool=tool, active=True)
     if not can_manage(request.user, course) or not tool.oidc_initiation_url:
         return HttpResponseBadRequest("Only course instructors can add LTI content.")
-    hint = lti13_hint({"kind": "deep_linking", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id})
+    assignment_id = request.GET.get("assignment")
+    if assignment_id and not Assignment.objects.filter(pk=assignment_id, course=course, submission_type=Assignment.SubmissionType.LTI_TOOL).exists():
+        return HttpResponseBadRequest("The LTI assignment is not available.")
+    hint = lti13_hint({"kind": "deep_linking", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id, "assignment_id": assignment_id})
     params = {"iss": settings.LTI_ISSUER, "client_id": tool.client_id, "login_hint": str(request.user.id), "target_link_uri": tool.launch_url, "lti_message_hint": hint}
     audit(request, "lti13.deep_linking_initiated", str(tool.id), course=course.id, deployment=deployment.deployment_id)
     return redirect(tool.oidc_initiation_url + ("&" if "?" in tool.oidc_initiation_url else "?") + urlencode(params))
@@ -159,7 +163,7 @@ def lti13_authorize(request):
     if not nonce or not state:
         return HttpResponseBadRequest("LTI state and nonce are required.")
     if kind == "deep_linking":
-        data = lti13_hint({"kind": "deep_linking_response", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id})
+        data = lti13_hint({"kind": "deep_linking_response", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id, "assignment_id": hint.get("assignment_id")})
         token = signed_platform_token(tool, deployment, course, request.user, nonce, "LtiDeepLinkingRequest", **{
             "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": tool.launch_url,
             LTI_DEEP_LINKING: {
@@ -176,6 +180,57 @@ def lti13_authorize(request):
         })
         audit(request, "lti13.launch", str(tool.id), course=course.id, deployment=deployment.deployment_id)
     return render(request, "core/lti_post.html", {"target": redirect_uri, "id_token": token, "state": state})
+
+@require_POST
+@csrf_exempt
+def lti13_deep_link_return(request):
+    """Verify a tool's signed Deep Linking response and create safe course placements."""
+    response_token = request.POST.get("JWT", "")
+    try:
+        unverified = jwt.decode(response_token, options={"verify_signature": False})
+        data = signing.loads(unverified.get(LTI_DEEP_LINKING, {}).get("data", ""), salt="lti13-launch", max_age=300)
+        if data.get("kind") != "deep_linking_response":
+            raise ValueError("Invalid Deep Linking response data.")
+        tool = LtiTool.objects.get(pk=data["tool_id"], lti_version="1.3", active=True)
+        deployment = LtiDeployment.objects.get(tool=tool, course_id=data["course_id"], active=True)
+        header = jwt.get_unverified_header(response_token)
+        with urlopen(tool.jwks_url, timeout=5) as response:
+            keys = json.load(response).get("keys", [])
+        jwk = next((key for key in keys if key.get("kid") == header.get("kid")), None)
+        if not jwk:
+            raise ValueError("The tool signing key was not found in its JWKS.")
+        claims = jwt.decode(response_token, jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk)), algorithms=["RS256"], audience=settings.LTI_ISSUER, options={"require": ["exp", "iat", "iss", "aud"]})
+        if claims.get(LTI_VERSION) != "1.3.0" or claims.get(LTI_DEPLOYMENT) != deployment.deployment_id or claims.get(LTI_MESSAGE_TYPE) != "LtiDeepLinkingResponse":
+            raise ValueError("The Deep Linking response is not valid for this deployment.")
+        if claims.get(LTI_DEEP_LINKING, {}).get("data") != unverified.get(LTI_DEEP_LINKING, {}).get("data"):
+            raise ValueError("The Deep Linking response data did not match.")
+        course = deployment.course
+        user_id = data.get("user_id")
+        user = get_user_model().objects.filter(pk=user_id, is_active=True).first()
+        if not user or not can_manage(user, course):
+            raise ValueError("The initiating user is no longer enrolled.")
+        items = claims.get(LTI_CONTENT_ITEMS, [])
+        if not isinstance(items, list) or not 1 <= len(items) <= 20:
+            raise ValueError("Select between one and twenty LTI resource links.")
+        assignment = None
+        if data.get("assignment_id"):
+            assignment = Assignment.objects.filter(pk=data["assignment_id"], course=course, submission_type=Assignment.SubmissionType.LTI_TOOL).first()
+            if not assignment:
+                raise ValueError("The linked assignment is no longer available.")
+        placements = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "ltiResourceLink" or item.get("url") != tool.launch_url:
+                raise ValueError("The tool returned an unsupported content item.")
+            title = str(item.get("title") or tool.name).strip()[:120]
+            if not title:
+                raise ValueError("Every selected content item needs a title.")
+            placements.append(ToolPlacement.objects.create(course=course, tool=tool, title=title, assignment=assignment))
+        AuditEvent.objects.create(actor_id=user_id, action="lti13.deep_linking_placed", target=str(tool.id), metadata={"course": course.id, "placements": [item.id for item in placements]})
+        from django.contrib import messages
+        messages.success(request, f"Added {len(placements)} tool {'link' if len(placements) == 1 else 'links'} to {course.code}.")
+        return redirect("course-assignment-detail", course_id=course.id, assignment_id=assignment.id) if assignment else redirect("lti-tools", course_id=course.id)
+    except (LtiTool.DoesNotExist, LtiDeployment.DoesNotExist, ValueError, KeyError, jwt.PyJWTError, OSError, json.JSONDecodeError) as error:
+        return HttpResponseBadRequest(f"Invalid LTI Deep Linking response: {error}")
 
 @require_GET
 def oidc_login(request):

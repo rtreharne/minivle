@@ -56,3 +56,4 @@ if not LTI_PRIVATE_KEY and DEBUG:
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     ).decode()
 LTI_KEY_ID = os.getenv("LTI_KEY_ID", "minivle-development-key")
+LTI_DEPLOYMENT_SYNC_SECRET = os.getenv("LTI_DEPLOYMENT_SYNC_SECRET", "")

@@ -28,12 +28,16 @@ class Enrollment(Timestamped):
         indexes = [models.Index(fields=["course", "role", "active"])]
 
 class Assignment(Timestamped):
+    class SubmissionType(models.TextChoices):
+        FILE_UPLOAD = "upload", "File upload"
+        LTI_TOOL = "lti", "External LTI tool"
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name="assignments")
     title = models.CharField(max_length=200)
     instructions = models.TextField()
     due_at = models.DateTimeField(null=True, blank=True)
     points_possible = models.DecimalField(max_digits=8, decimal_places=2, default=100)
     published = models.BooleanField(default=False)
+    submission_type = models.CharField(max_length=12, choices=SubmissionType.choices, default=SubmissionType.FILE_UPLOAD)
     class Meta: ordering = ["due_at", "id"]
 
 class Submission(Timestamped):
@@ -68,6 +72,7 @@ class LtiTool(Timestamped):
     deployment_id = models.CharField(max_length=255, blank=True)
     jwks_url = models.URLField(blank=True)
     oidc_initiation_url = models.URLField(blank=True)
+    deployment_registration_url = models.URLField(blank=True)
     scopes = models.JSONField(default=list, blank=True)
     active = models.BooleanField(default=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
@@ -78,6 +83,7 @@ class ToolPlacement(Timestamped):
     tool = models.ForeignKey(LtiTool, on_delete=models.CASCADE, related_name="placements")
     title = models.CharField(max_length=120)
     assignment = models.ForeignKey(Assignment, null=True, blank=True, on_delete=models.SET_NULL)
+    visible_in_course_navigation = models.BooleanField(default=True)
 
 class LtiDeployment(Timestamped):
     tool = models.ForeignKey(LtiTool, on_delete=models.CASCADE, related_name="deployments")

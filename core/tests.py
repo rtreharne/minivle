@@ -4,6 +4,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.urls import reverse
 from urllib.parse import parse_qs, urlparse
+import jwt
 from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
 
 class LearningWorkflowTests(TestCase):
@@ -138,3 +139,17 @@ class LearningWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "lti-tool-frame")
         self.assertContains(response, reverse("lti13-start", args=[placement.id]))
+
+    def test_lti13_deep_linking_request_is_instructor_only_and_signed(self):
+        tool = LtiTool.objects.create(name="Counter", launch_url="http://localhost:8002/lti/launch", oidc_initiation_url="http://localhost:8002/oidc/login", jwks_url="http://localhost:8002/.well-known/jwks.json", lti_version="1.3", client_id="counter-deep-link", active=True)
+        LtiDeployment.objects.create(tool=tool, course=self.course, deployment_id="counter-deep-link-deployment")
+        self.client.login(username="learner", password="pass")
+        self.assertEqual(self.client.get(reverse("lti13-deep-link-start", args=[self.course.id, tool.id])).status_code, 400)
+        self.client.login(username="teacher", password="pass")
+        start = self.client.get(reverse("lti13-deep-link-start", args=[self.course.id, tool.id]))
+        query = parse_qs(urlparse(start["Location"]).query)
+        response = self.client.get(reverse("lti13-authorize"), {"client_id": tool.client_id, "redirect_uri": tool.launch_url, "state": "state", "nonce": "nonce", "lti_message_hint": query["lti_message_hint"][0]})
+        token = response.content.decode().split('name="id_token" value="', 1)[1].split('"', 1)[0]
+        claims = jwt.decode(token, options={"verify_signature": False})
+        self.assertEqual(claims["https://purl.imsglobal.org/spec/lti/claim/message_type"], "LtiDeepLinkingRequest")
+        self.assertEqual(claims["https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings"]["accept_types"], ["ltiResourceLink"])
