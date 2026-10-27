@@ -2,6 +2,7 @@
 import json, time, uuid
 from urllib.request import urlopen
 from urllib.parse import parse_qs, urlencode
+from .network import server_fetch_url
 import jwt
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
@@ -194,7 +195,7 @@ def lti13_deep_link_return(request):
         tool = LtiTool.objects.get(pk=data["tool_id"], lti_version="1.3", active=True)
         deployment = LtiDeployment.objects.get(tool=tool, course_id=data["course_id"], active=True)
         header = jwt.get_unverified_header(response_token)
-        with urlopen(tool.jwks_url, timeout=5) as response:
+        with urlopen(server_fetch_url(tool.jwks_url), timeout=5) as response:
             keys = json.load(response).get("keys", [])
         jwk = next((key for key in keys if key.get("kid") == header.get("kid")), None)
         if not jwk:

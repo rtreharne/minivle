@@ -83,6 +83,12 @@ class LtiRegistrationForm(forms.ModelForm):
 class LtiConfigImportForm(forms.Form):
     config_url = forms.URLField(label="Tool configuration URL")
 
+class LtiNavigationLabelForm(forms.ModelForm):
+    class Meta:
+        model = LtiTool
+        fields = ["navigation_label"]
+        labels = {"navigation_label": "Global course navigation label"}
+
 class LtiDeploymentForm(forms.ModelForm):
     class Meta:
         model = LtiDeployment

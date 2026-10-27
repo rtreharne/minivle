@@ -63,6 +63,7 @@ class Grade(Timestamped):
 
 class LtiTool(Timestamped):
     name = models.CharField(max_length=120)
+    navigation_label = models.CharField(max_length=120, blank=True)
     launch_url = models.URLField()
     lti_version = models.CharField(max_length=8, choices=[("1.1", "LTI 1.1"), ("1.3", "LTI 1.3")])
     consumer_key = models.CharField(max_length=255, blank=True)

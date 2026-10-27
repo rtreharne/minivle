@@ -9,4 +9,6 @@ urlpatterns = [path("admin/", admin.site.urls), path("", include("core.urls")), 
 # reverse proxy. Serve collected assets here; production should serve
 # STATIC_ROOT directly from a CDN or web server.
 if settings.DEBUG:
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+    # In local Compose development this directory is bind-mounted, so CSS and
+    # JavaScript edits are available on refresh without rebuilding the image.
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.BASE_DIR / "core" / "static")

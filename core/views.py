@@ -10,14 +10,16 @@ from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
+from django.db import transaction
 from django.db.models import Max, Q
 from django.http import Http404
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from .api import audit
-from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiRegistrationForm, LtiToolForm, PlacementConfigurationForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
+from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiNavigationLabelForm, LtiRegistrationForm, LtiToolForm, PlacementConfigurationForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
 from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
+from .network import server_fetch_url
 from .permissions import can_manage, course_role, enrolled_or_404, is_platform_admin, student_preview_active
 
 platform_admin_required = user_passes_test(is_platform_admin, login_url="dashboard")
@@ -28,9 +30,20 @@ def sync_tool_deployment(tool, deployment):
         return
     if not settings.LTI_DEPLOYMENT_SYNC_SECRET:
         raise ValueError("Deployment sync is not configured on this MiniVLE instance.")
-    payload = json.dumps({"issuer": settings.LTI_ISSUER, "client_id": tool.client_id, "deployment_id": deployment.deployment_id}, separators=(",", ":")).encode()
+    course = deployment.course
+    payload = json.dumps({
+        "issuer": settings.LTI_ISSUER,
+        "client_id": tool.client_id,
+        "deployment_id": deployment.deployment_id,
+        "course": {
+            "id": str(course.id),
+            "label": course.code,
+            "title": course.title,
+            "active_enrollments": course.enrollments.filter(active=True).count(),
+        },
+    }, separators=(",", ":")).encode()
     signature = hmac.new(settings.LTI_DEPLOYMENT_SYNC_SECRET.encode(), payload, hashlib.sha256).hexdigest()
-    request = Request(tool.deployment_registration_url, data=payload, method="POST", headers={"Content-Type": "application/json", "X-MiniVLE-Deployment-Signature": signature})
+    request = Request(server_fetch_url(tool.deployment_registration_url), data=payload, method="POST", headers={"Content-Type": "application/json", "X-MiniVLE-Deployment-Signature": signature})
     with urlopen(request, timeout=5) as response:
         if response.status not in (200, 201, 204):
             raise ValueError("The tool rejected deployment registration.")
@@ -324,13 +337,13 @@ def platform_lti(request):
             import_form = LtiConfigImportForm(request.POST)
             if import_form.is_valid():
                 try:
-                    with urlopen(import_form.cleaned_data["config_url"], timeout=5) as response:
+                    with urlopen(server_fetch_url(import_form.cleaned_data["config_url"]), timeout=5) as response:
                         config = json.load(response)
                     required = ("title", "oidc_initiation_url", "target_link_uri", "public_jwk_url")
                     if any(not config.get(field) for field in required): raise ValueError("Configuration is missing one or more required LTI 1.3 fields.")
                     tool = LtiTool.objects.create(
                         name=config["title"], launch_url=config["target_link_uri"], oidc_initiation_url=config["oidc_initiation_url"],
-                        jwks_url=config["public_jwk_url"], deployment_registration_url=config.get("minivle_deployment_registration_url", ""), scopes=config.get("scopes", []), lti_version="1.3",
+                        jwks_url=config["public_jwk_url"], deployment_registration_url=config.get("minivle_deployment_registration_url", ""), scopes=config.get("scopes", []), navigation_label=config["title"], lti_version="1.3",
                         client_id=f"minivle-{secrets.token_urlsafe(18)}", created_by=request.user, active=True,
                     )
                     audit(request, "lti13.registration_imported", str(tool.id), source=import_form.cleaned_data["config_url"], client_id=tool.client_id)
@@ -344,12 +357,33 @@ def platform_lti(request):
 def platform_lti_detail(request, tool_id):
     tool = get_object_or_404(LtiTool, pk=tool_id, lti_version="1.3")
     deployment_form = LtiDeploymentForm()
+    navigation_form = LtiNavigationLabelForm(instance=tool)
     if request.method == "POST":
+        if request.POST.get("action") == "delete":
+            if request.POST.get("confirm_delete") != "on":
+                messages.error(request, "Confirm deletion to remove this LTI 1.3 registration.")
+                return redirect(request.path)
+            placement_count = tool.placements.count()
+            deployment_count = tool.deployments.count()
+            tool_name, registration_id = tool.name, tool.id
+            with transaction.atomic():
+                tool.delete()
+                audit(request, "lti13.registration_deleted", str(registration_id), tool_name=tool_name, deployments=deployment_count, placements=placement_count)
+            messages.success(request, f"Deleted {tool_name} and its {deployment_count} deployment(s) and {placement_count} placement(s).")
+            return redirect("platform-lti")
         if request.POST.get("action") == "toggle":
             tool.active = not tool.active; tool.save(update_fields=["active", "updated_at"])
             audit(request, "lti13.registration_toggled", str(tool.id), active=tool.active)
             return redirect(request.path)
-        deployment_form = LtiDeploymentForm(request.POST)
+        if request.POST.get("action") == "navigation-label":
+            navigation_form = LtiNavigationLabelForm(request.POST, instance=tool)
+            if navigation_form.is_valid():
+                navigation_form.save()
+                audit(request, "lti13.navigation_label_updated", str(tool.id), navigation_label=tool.navigation_label)
+                messages.success(request, "Global course navigation label updated.")
+                return redirect(request.path)
+        elif request.POST.get("action") == "deploy":
+            deployment_form = LtiDeploymentForm(request.POST)
         if deployment_form.is_valid():
             deployment, created = LtiDeployment.objects.get_or_create(
                 tool=tool, course=deployment_form.cleaned_data["course"],
@@ -362,12 +396,12 @@ def platform_lti_detail(request, tool_id):
             except (OSError, ValueError) as error:
                 if created: deployment.delete()
                 deployment_form.add_error(None, f"Could not register this deployment with the tool: {error}")
-                return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form})
+                return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form, "navigation_form": navigation_form})
             audit(request, "lti13.deployment_created", str(deployment.id), course=deployment.course_id, deployment_id=deployment.deployment_id)
             messages.success(request, "LTI deployment is ready. Add a course placement from the course LTI tools page.")
             return redirect(request.path)
     deployment_form.fields["course"].queryset = Course.objects.filter(is_archived=False)
-    return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form})
+    return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form, "navigation_form": navigation_form})
 
 @platform_admin_required
 def platform_people(request):

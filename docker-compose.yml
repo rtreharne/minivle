@@ -20,10 +20,26 @@ services:
       db: {condition: service_healthy}
       redis: {condition: service_started}
       objectstore: {condition: service_started}
+      lti-key-init: {condition: service_completed_successfully}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./secrets/lti-development-private.pem:/run/secrets/lti_private_key:ro
+      - lti_secrets:/run/secrets:ro
+      - ./core/static:/app/core/static:ro
+  lti-key-init:
+    build: .
+    user: root
+    command:
+      - sh
+      - -ec
+      - |
+        if [ ! -s /run/secrets/lti_private_key ]; then
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /run/secrets/lti_private_key
+        fi
+        chown app:app /run/secrets/lti_private_key
+        chmod 600 /run/secrets/lti_private_key
+    volumes:
+      - lti_secrets:/run/secrets
   db:
     image: postgres:16-alpine
     environment:
@@ -46,3 +62,4 @@ services:
 volumes:
   postgres_data:
   objectstore_data:
+  lti_secrets:

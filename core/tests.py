@@ -6,6 +6,22 @@ from django.urls import reverse
 from urllib.parse import parse_qs, urlparse
 import jwt
 from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
+from .network import server_fetch_url
+from django.test import override_settings
+
+
+class LocalDevelopmentNetworkingTests(TestCase):
+    @override_settings(DEBUG=True)
+    def test_server_fetch_routes_localhost_through_docker_host_gateway(self):
+        self.assertEqual(
+            server_fetch_url("http://localhost:8002/lti/config.json"),
+            "http://host.docker.internal:8002/lti/config.json",
+        )
+
+    @override_settings(DEBUG=False)
+    def test_server_fetch_preserves_localhost_outside_development(self):
+        url = "http://localhost:8002/lti/config.json"
+        self.assertEqual(server_fetch_url(url), url)
 
 class LearningWorkflowTests(TestCase):
     def setUp(self):
@@ -68,6 +84,24 @@ class LearningWorkflowTests(TestCase):
         self.instructor.profile.save()
         self.client.login(username="teacher", password="pass")
         self.assertEqual(self.client.get("/platform/").status_code, 200)
+
+    def test_platform_admin_can_delete_lti13_registration_and_related_records(self):
+        self.instructor.profile.is_platform_admin = True
+        self.instructor.profile.save()
+        tool = LtiTool.objects.create(name="Disposable Counter", launch_url="https://tool.example/launch", oidc_initiation_url="https://tool.example/login", jwks_url="https://tool.example/jwks", lti_version="1.3", client_id="disposable-client")
+        deployment = LtiDeployment.objects.create(tool=tool, course=self.course, deployment_id="disposable-deployment")
+        placement = ToolPlacement.objects.create(course=self.course, tool=tool, title="Disposable Counter")
+        self.client.login(username="teacher", password="pass")
+        detail = reverse("platform-lti-detail", args=[tool.id])
+        response = self.client.post(detail, {"action": "delete"})
+        self.assertRedirects(response, detail)
+        self.assertTrue(LtiTool.objects.filter(pk=tool.id).exists())
+        response = self.client.post(detail, {"action": "delete", "confirm_delete": "on"})
+        self.assertRedirects(response, reverse("platform-lti"))
+        self.assertFalse(LtiTool.objects.filter(pk=tool.id).exists())
+        self.assertFalse(LtiDeployment.objects.filter(pk=deployment.id).exists())
+        self.assertFalse(ToolPlacement.objects.filter(pk=placement.id).exists())
+        self.assertTrue(AuditEvent.objects.filter(action="lti13.registration_deleted", target=str(tool.id)).exists())
 
     def test_instructor_student_preview_can_create_test_submission(self):
         self.client.login(username="teacher", password="pass")

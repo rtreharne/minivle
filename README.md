@@ -12,6 +12,15 @@ MiniVLE requires Docker Compose.
 docker compose up --build
 ```
 
+On its first run, Docker Compose generates an RSA key for local LTI development
+and stores it in the `lti_secrets` Docker volume. No `secrets/` directory or
+`.pem` file is needed on the host. The key is reused on later starts; remove
+that named volume only when you intentionally want to replace the local key.
+
+In local Compose development, files under `core/static/` are mounted directly
+into the web service. Changes to CSS or JavaScript take effect on a browser
+refresh—no Docker rebuild or redeploy is required.
+
 Open [http://localhost:8000](http://localhost:8000).
 
 The web service automatically applies migrations and collects static assets on startup. Local services are:
@@ -84,7 +93,7 @@ Both applications must share `LTI_DEPLOYMENT_SYNC_SECRET`. The checked-in Compos
 - `GET /lti/nrps/{course_id}/memberships` — development roster service
 - `POST /lti/ags/assignments/{assignment_id}/students/{student_id}/score` — development score passback
 
-Set `LTI_PRIVATE_KEY` (or `LTI_PRIVATE_KEY_FILE`) to a persistent RSA PEM and set `LTI_ISSUER` to the public HTTPS base URL before production LTI testing. Local Docker mounts a development key at `secrets/lti-development-private.pem`; it is ignored by Git.
+Set `LTI_PRIVATE_KEY` (or `LTI_PRIVATE_KEY_FILE`) to a persistent RSA PEM and set `LTI_ISSUER` to the public HTTPS base URL before production LTI testing. Local Docker generates and persists a development key in its `lti_secrets` named volume; do not use that development key in production.
 
 ## Tests
 
