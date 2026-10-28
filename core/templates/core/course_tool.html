@@ -1,1 +1,8 @@
-{% extends 'core/base.html' %}{% block title %}{{ placement.title }} · {{ course.code }} · MiniVLE{% endblock %}{% block content %}<div class="page-head"><div><p class="eyebrow">Course tool</p><h1>{{ placement.title }}</h1><p class="muted">{{ placement.tool.name }} · LTI 1.3</p></div><a class="secondary-btn" href="{% url 'lti-tools' course.id %}">Tool settings</a></div><section class="tool-frame-shell"><iframe title="{{ placement.title }}" src="{% url 'lti13-start' placement.id %}" name="lti-tool-frame" allow="fullscreen" referrerpolicy="strict-origin-when-cross-origin">Loading {{ placement.title }}…</iframe></section><p class="tool-frame-note">This external tool is running inside {{ course.code }}. Its learner session is created from this signed LTI launch.</p>{% endblock %}
+{% extends 'core/base.html' %}
+{% block body_class %}course-tool-page{% endblock %}
+{% block title %}{{ placement.title }} · {{ course.code }} · MiniVLE{% endblock %}
+{% block content %}
+<section class="tool-frame-shell tool-frame-shell-embedded">
+  <iframe title="{{ placement.title }}" src="{% url 'lti13-start' placement.id %}" name="lti-tool-frame" allow="fullscreen" referrerpolicy="strict-origin-when-cross-origin">Loading {{ placement.title }}…</iframe>
+</section>
+{% endblock %}

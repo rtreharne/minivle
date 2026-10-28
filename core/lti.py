@@ -1,5 +1,6 @@
 """LTI platform endpoints. Production deployments must set LTI_PRIVATE_KEY and enforce HTTPS."""
-import json, time, uuid
+import hashlib, json, secrets, time, uuid
+from datetime import timedelta
 from urllib.request import urlopen
 from urllib.parse import parse_qs, urlencode
 from .network import server_fetch_url
@@ -10,14 +11,15 @@ from django.contrib.auth import get_user_model
 from django.core import signing
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 from django.views.decorators.clickjacking import xframe_options_exempt
 from django.views.decorators.csrf import csrf_exempt
 from oauthlib.oauth1 import Client, SIGNATURE_TYPE_BODY, RequestValidator, SignatureOnlyEndpoint
 from oauth2_provider.decorators import protected_resource
 from .api import audit
-from .models import Assignment, AuditEvent, Grade, LtiDeployment, LtiTool, ToolPlacement
-from .permissions import can_manage, course_role
+from .models import Assignment, AuditEvent, Grade, LtiDeployment, LtiServiceToken, LtiTool, ToolPlacement
+from .permissions import can_manage, course_role, is_platform_admin, student_preview_active
 
 LTI_VERSION = "https://purl.imsglobal.org/spec/lti/claim/version"
 LTI_DEPLOYMENT = "https://purl.imsglobal.org/spec/lti/claim/deployment_id"
@@ -25,19 +27,42 @@ LTI_MESSAGE_TYPE = "https://purl.imsglobal.org/spec/lti/claim/message_type"
 LTI_CONTEXT = "https://purl.imsglobal.org/spec/lti/claim/context"
 LTI_DEEP_LINKING = "https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings"
 LTI_CONTENT_ITEMS = "https://purl.imsglobal.org/spec/lti-dl/claim/content_items"
+LTI_NRPS_SCOPE = "https://purl.imsglobal.org/spec/lti-nrps/scope/contextmembership.readonly"
+LTI_NRPS_CLAIM = "https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice"
+
+LTI_ROLES = "https://purl.imsglobal.org/spec/lti/claim/roles"
+LTI_MEMBERSHIP_ROLE = "http://purl.imsglobal.org/vocab/lis/v2/membership#"
+LTI_INSTITUTION_ROLE = "http://purl.imsglobal.org/vocab/lis/v2/institution/person#"
+
+def lti13_roles(user, course, as_student=False):
+    """Return standard LTI roles for the user's platform and course access."""
+    if as_student:
+        return [LTI_MEMBERSHIP_ROLE + "Learner"]
+    course_access = course_role(user, course)
+    roles = [LTI_MEMBERSHIP_ROLE + ("Instructor" if course_access in ("instructor", "admin") else "Learner")]
+    if course_access == "admin":
+        roles.append(LTI_MEMBERSHIP_ROLE + "Administrator")
+    if is_platform_admin(user):
+        roles.append(LTI_INSTITUTION_ROLE + "Administrator")
+    return roles
 
 def lti13_hint(payload):
     return signing.dumps(payload, salt="lti13-launch")
 
-def signed_platform_token(tool, deployment, course, user, nonce, message_type, **claims):
+def signed_platform_token(tool, deployment, course, user, nonce, message_type, as_student=False, **claims):
     now = int(time.time())
     base = {
         "iss": settings.LTI_ISSUER, "aud": tool.client_id, "sub": str(user.pk), "iat": now, "exp": now + 300, "nonce": nonce,
         LTI_VERSION: "1.3.0", LTI_DEPLOYMENT: deployment.deployment_id, LTI_MESSAGE_TYPE: message_type,
         LTI_CONTEXT: {"id": str(course.id), "label": course.code, "title": course.title},
-        "https://purl.imsglobal.org/spec/lti/claim/roles": ["http://purl.imsglobal.org/vocab/lis/v2/membership#" + ("Instructor" if course_role(user, course) in ("instructor", "admin") else "Learner")],
+        LTI_ROLES: lti13_roles(user, course, as_student=as_student),
         "name": user.get_full_name() or user.username, "email": user.email,
     }
+    if LTI_NRPS_SCOPE in (tool.scopes or []):
+        base[LTI_NRPS_CLAIM] = {
+            "context_memberships_url": f"{settings.LTI_ISSUER}/lti/nrps/{course.id}/memberships",
+            "service_versions": ["2.0"],
+        }
     base.update(claims)
     return jwt.encode(base, settings.LTI_PRIVATE_KEY, algorithm="RS256", headers={"kid": settings.LTI_KEY_ID})
 
@@ -56,7 +81,10 @@ class ToolValidator(RequestValidator):
 
 def lti11_fields(tool, user, placement):
     role = course_role(user, placement.course)
-    params = {"lti_version": "LTI-1p0", "lti_message_type": "basic-lti-launch-request", "resource_link_id": f"placement-{placement.id}", "user_id": str(user.id), "roles": "Instructor" if role == "instructor" else "Learner", "context_id": str(placement.course_id), "context_label": placement.course.code, "context_title": placement.course.title, "lis_person_name_full": user.get_full_name() or user.username, "lis_person_contact_email_primary": user.email}
+    roles = ["Instructor" if role == "instructor" else "Learner"]
+    if is_platform_admin(user):
+        roles.append("urn:lti:instrole:ims/lis/Administrator")
+    params = {"lti_version": "LTI-1p0", "lti_message_type": "basic-lti-launch-request", "resource_link_id": f"placement-{placement.id}", "user_id": str(user.id), "roles": ",".join(roles), "context_id": str(placement.course_id), "context_label": placement.course.code, "context_title": placement.course.title, "lis_person_name_full": user.get_full_name() or user.username, "lis_person_contact_email_primary": user.email}
     if placement.assignment_id: params["lis_result_sourcedid"] = f"mini:{placement.assignment_id}:{user.id}"; params["lis_outcome_service_url"] = settings.LTI_ISSUER + "/lti/1p1/outcomes/"
     client = Client(tool.consumer_key, client_secret=tool.shared_secret, signature_type=SIGNATURE_TYPE_BODY)
     _, _, signed = client.sign(tool.launch_url, http_method="POST", body=urlencode(params), headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -104,7 +132,10 @@ def lti13_start(request, placement_id):
     deployment = LtiDeployment.objects.filter(tool=tool, course=placement.course, active=True).first()
     if not course_role(request.user, placement.course) or not tool.active or not deployment or not tool.oidc_initiation_url:
         return HttpResponseBadRequest("This LTI 1.3 placement is not available.")
-    hint = lti13_hint({"kind": "resource_link", "placement_id": placement.id, "user_id": request.user.id})
+    hint = lti13_hint({
+        "kind": "resource_link", "placement_id": placement.id, "user_id": request.user.id,
+        "as_student": student_preview_active(request, placement.course),
+    })
     params = {
         "iss": settings.LTI_ISSUER, "client_id": tool.client_id,
         "login_hint": str(request.user.id), "target_link_uri": tool.launch_url,
@@ -131,11 +162,10 @@ def lti13_deep_link_start(request, course_id, tool_id):
     audit(request, "lti13.deep_linking_initiated", str(tool.id), course=course.id, deployment=deployment.deployment_id)
     return redirect(tool.oidc_initiation_url + ("&" if "?" in tool.oidc_initiation_url else "?") + urlencode(params))
 
-@login_required
 @require_GET
 @xframe_options_exempt
 def lti13_authorize(request):
-    """Return a signed LTI Resource Link or Deep Linking id_token to a registered tool."""
+    """Return a signed launch for a previously authenticated, signed LTI request."""
     client_id, redirect_uri = request.GET.get("client_id", ""), request.GET.get("redirect_uri", "")
     tool = LtiTool.objects.filter(lti_version="1.3", client_id=client_id, active=True).first()
     if not tool or redirect_uri != tool.launch_url or not settings.LTI_PRIVATE_KEY:
@@ -144,17 +174,18 @@ def lti13_authorize(request):
         hint = signing.loads(request.GET.get("lti_message_hint", ""), salt="lti13-launch", max_age=300)
     except signing.BadSignature:
         return HttpResponseBadRequest("Invalid or expired LTI launch hint.")
-    if hint.get("user_id") != request.user.id:
-        return HttpResponseBadRequest("The LTI launch does not belong to this user.")
+    user = get_user_model().objects.filter(pk=hint.get("user_id"), is_active=True).first()
+    if not user:
+        return HttpResponseBadRequest("The LTI launch user is no longer active.")
     kind = hint.get("kind", "resource_link")
     placement = None
     if kind == "resource_link":
         placement = ToolPlacement.objects.select_related("course").filter(pk=hint.get("placement_id"), tool=tool).first()
         course = placement and placement.course
-        permitted = course and course_role(request.user, course)
+        permitted = course and course_role(user, course)
     elif kind == "deep_linking":
         course = get_object_or_404(LtiDeployment, course_id=hint.get("course_id"), tool=tool, active=True).course
-        permitted = can_manage(request.user, course)
+        permitted = can_manage(user, course)
     else:
         return HttpResponseBadRequest("Unsupported LTI launch type.")
     deployment = course and LtiDeployment.objects.filter(tool=tool, course=course, active=True).first()
@@ -164,8 +195,8 @@ def lti13_authorize(request):
     if not nonce or not state:
         return HttpResponseBadRequest("LTI state and nonce are required.")
     if kind == "deep_linking":
-        data = lti13_hint({"kind": "deep_linking_response", "course_id": course.id, "tool_id": tool.id, "user_id": request.user.id, "assignment_id": hint.get("assignment_id")})
-        token = signed_platform_token(tool, deployment, course, request.user, nonce, "LtiDeepLinkingRequest", **{
+        data = lti13_hint({"kind": "deep_linking_response", "course_id": course.id, "tool_id": tool.id, "user_id": user.id, "assignment_id": hint.get("assignment_id")})
+        token = signed_platform_token(tool, deployment, course, user, nonce, "LtiDeepLinkingRequest", **{
             "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": tool.launch_url,
             LTI_DEEP_LINKING: {
                 "deep_link_return_url": request.build_absolute_uri("/lti/deep-linking/return/"),
@@ -173,13 +204,13 @@ def lti13_authorize(request):
                 "accept_media_types": "*/*", "auto_create": False, "data": data,
             },
         })
-        audit(request, "lti13.deep_linking_launch", str(tool.id), course=course.id, deployment=deployment.deployment_id)
+        AuditEvent.objects.create(actor=user, action="lti13.deep_linking_launch", target=str(tool.id), metadata={"course": course.id, "deployment": deployment.deployment_id})
     else:
-        token = signed_platform_token(tool, deployment, course, request.user, nonce, "LtiResourceLinkRequest", **{
+        token = signed_platform_token(tool, deployment, course, user, nonce, "LtiResourceLinkRequest", as_student=bool(hint.get("as_student")), **{
             "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": tool.launch_url,
             "https://purl.imsglobal.org/spec/lti/claim/resource_link": {"id": f"placement-{placement.id}", "title": placement.title},
         })
-        audit(request, "lti13.launch", str(tool.id), course=course.id, deployment=deployment.deployment_id)
+        AuditEvent.objects.create(actor=user, action="lti13.launch", target=str(tool.id), metadata={"course": course.id, "deployment": deployment.deployment_id})
     return render(request, "core/lti_post.html", {"target": redirect_uri, "id_token": token, "state": state})
 
 @require_POST
@@ -260,18 +291,93 @@ def lti13_launch(request):
         "https://purl.imsglobal.org/spec/lti/claim/version": "1.3.0", "https://purl.imsglobal.org/spec/lti/claim/deployment_id": tool.deployment_id,
         "https://purl.imsglobal.org/spec/lti/claim/message_type": "LtiResourceLinkRequest", "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": data["target"],
         "https://purl.imsglobal.org/spec/lti/claim/context": {"id": str(placement.course_id), "label": placement.course.code, "title": placement.course.title},
-        "https://purl.imsglobal.org/spec/lti/claim/roles": ["http://purl.imsglobal.org/vocab/lis/v2/membership#" + ("Instructor" if role == "instructor" else "Learner")],
+        LTI_ROLES: lti13_roles(request.user, placement.course, as_student=student_preview_active(request, placement.course)),
         "name": request.user.get_full_name() or request.user.username, "email": request.user.email}
     token = jwt.encode(claims, settings.LTI_PRIVATE_KEY, algorithm="RS256", headers={"kid": settings.LTI_KEY_ID})
     audit(request, "lti13.launch", str(tool.id), course=placement.course_id)
     return render(request, "core/lti_post.html", {"target": data["target"], "id_token": token, "state": state})
 
 @require_GET
-@protected_resource(scopes=["read"])
 def nrps(request, course_id):
-    course = get_object_or_404(ToolPlacement, course_id=course_id).course
-    members = [{"user_id": str(e.user_id), "name": e.user.get_full_name() or e.user.username, "email": e.user.email, "roles": [e.role]} for e in course.enrollments.select_related("user").filter(active=True)]
-    return JsonResponse({"id": str(course.id), "context": {"label": course.code, "title": course.title}, "members": members})
+    raw_token = request.headers.get("Authorization", "")
+    if not raw_token.startswith("Bearer "):
+        return JsonResponse({"error": "invalid_token"}, status=401)
+    token_hash = hashlib.sha256(raw_token[7:].encode()).hexdigest()
+    token = LtiServiceToken.objects.select_related("tool", "deployment", "deployment__course").filter(token_hash=token_hash, expires_at__gt=timezone.now()).first()
+    if not token or LTI_NRPS_SCOPE not in token.scopes or token.deployment.course_id != course_id or not token.deployment.active:
+        return JsonResponse({"error": "invalid_token"}, status=401)
+    course = token.deployment.course
+    enrollments = course.enrollments.select_related("user").filter(active=True)
+    role_filter = request.GET.get("role", "").split("#")[-1].split("/")[-1]
+    role_names = {"student": "Learner", "instructor": "Instructor", "admin": "Administrator"}
+    members = []
+    for enrollment in enrollments:
+        role_name = role_names.get(enrollment.role, "Member")
+        if role_filter and role_filter.lower() not in {role_name.lower(), enrollment.role.lower()}:
+            continue
+        members.append({"user_id": str(enrollment.user_id), "name": enrollment.user.get_full_name() or enrollment.user.username,
+                        "roles": [f"http://purl.imsglobal.org/vocab/lis/v2/membership#{role_name}"], "status": "Active"})
+    try:
+        limit = max(1, min(int(request.GET.get("limit", "100")), 1000))
+        offset = max(0, int(request.GET.get("offset", "0")))
+    except ValueError:
+        return HttpResponseBadRequest("Invalid pagination parameters.")
+    page = members[offset:offset + limit]
+    response = JsonResponse({"id": request.build_absolute_uri(), "context": {"id": str(course.id), "label": course.code, "title": course.title}, "members": page})
+    if offset + limit < len(members):
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(request.build_absolute_uri())
+        query = dict(request.GET.items()); query["offset"] = str(offset + limit); query["limit"] = str(limit)
+        next_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+        response["Link"] = f"<{next_url}>; rel=\"next\""
+    response["Cache-Control"] = "no-store"
+    response["Content-Type"] = "application/vnd.ims.lti-nrps.v2.membershipcontainer+json"
+    return response
+
+
+@csrf_exempt
+@require_POST
+def lti_service_token(request):
+    """Issue short-lived NRPS access tokens using the LTI client-credentials flow."""
+    if request.POST.get("grant_type") != "client_credentials" or request.POST.get("client_assertion_type") != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer":
+        return JsonResponse({"error": "unsupported_grant_type"}, status=400)
+    requested_scopes = request.POST.get("scope", "").split()
+    if not requested_scopes or any(scope != LTI_NRPS_SCOPE for scope in requested_scopes):
+        return JsonResponse({"error": "invalid_scope"}, status=400)
+    assertion = request.POST.get("client_assertion", "")
+    try:
+        header = jwt.get_unverified_header(assertion)
+        unverified = jwt.decode(assertion, options={"verify_signature": False, "verify_aud": False})
+        client_id = unverified.get("iss")
+        if not client_id or unverified.get("sub") != client_id or not unverified.get("jti"):
+            raise ValueError("Invalid client assertion claims.")
+        tool = LtiTool.objects.filter(client_id=client_id, lti_version="1.3", active=True).first()
+        if not tool or LTI_NRPS_SCOPE not in (tool.scopes or []) or not tool.jwks_url:
+            raise ValueError("Unknown tool client.")
+        with urlopen(server_fetch_url(tool.jwks_url), timeout=5) as response:
+            keys = json.load(response).get("keys", [])
+        jwk = next((key for key in keys if key.get("kid") == header.get("kid")), None)
+        if not jwk:
+            raise ValueError("Client signing key not found.")
+        token_url = request.build_absolute_uri()
+        claims = jwt.decode(assertion, jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk)), algorithms=["RS256"], audience=token_url,
+                            options={"require": ["iss", "sub", "aud", "iat", "exp", "jti"]})
+        if int(claims["exp"]) - int(claims["iat"]) > 300 or int(claims["exp"]) < int(time.time()):
+            raise ValueError("Client assertion lifetime is invalid.")
+        deployment_id = claims.get(LTI_DEPLOYMENT)
+        deployment = LtiDeployment.objects.filter(tool=tool, deployment_id=deployment_id, active=True).first()
+        if not deployment:
+            raise ValueError("Unknown LTI deployment.")
+        if LtiServiceToken.objects.filter(assertion_jti=claims["jti"]).exists():
+            raise ValueError("Client assertion has already been used.")
+    except Exception:
+        return JsonResponse({"error": "invalid_client"}, status=401)
+    service_token = secrets.token_urlsafe(40)
+    LtiServiceToken.objects.create(tool=tool, deployment=deployment, token_hash=hashlib.sha256(service_token.encode()).hexdigest(),
+                                   assertion_jti=claims["jti"], scopes=requested_scopes,
+                                   expires_at=timezone.now() + timedelta(minutes=5))
+    LtiServiceToken.objects.filter(expires_at__lt=timezone.now() - timedelta(days=1)).delete()
+    return JsonResponse({"access_token": service_token, "token_type": "Bearer", "expires_in": 300, "scope": " ".join(requested_scopes)}, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 @require_POST
 @protected_resource(scopes=["write"])

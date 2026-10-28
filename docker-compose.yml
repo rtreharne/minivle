@@ -1,11 +1,13 @@
 services:
   web:
     build: .
-    ports: ["8000:8000"]
+    ports: ["8001:8000"]
     environment:
       DEBUG: "true"
-      ALLOWED_HOSTS: localhost,127.0.0.1,host.docker.internal,testserver
+      ALLOWED_HOSTS: localhost,127.0.0.1,host.docker.internal,testserver,demo.minivle.com
+      CSRF_TRUSTED_ORIGINS: https://demo.minivle.com
       SECRET_KEY: change-this-before-production
+      LTI_ISSUER: https://demo.minivle.com
       POSTGRES_HOST: db
       POSTGRES_DB: minivle
       POSTGRES_USER: minivle
@@ -26,6 +28,16 @@ services:
     volumes:
       - lti_secrets:/run/secrets:ro
       - ./core/static:/app/core/static:ro
+  cloudflared:
+    image: cloudflare/cloudflared:2026.3.0
+    user: "1000:1000"
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    restart: unless-stopped
+    depends_on:
+      - web
+    volumes:
+      - ./cloudflared-minivle/config.yml:/etc/cloudflared/config.yml:ro
+      - ./cloudflared-minivle/credentials.json:/etc/cloudflared/credentials.json:ro
   lti-key-init:
     build: .
     user: root

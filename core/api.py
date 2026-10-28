@@ -2,6 +2,7 @@ import os
 import boto3
 from botocore.exceptions import ClientError
 from django.conf import settings
+from django.core.files.storage import default_storage
 from django.contrib.auth.models import User
 from django.db.models import Max
 from rest_framework import permissions, status, viewsets
@@ -41,6 +42,17 @@ class AssignmentViewSet(viewsets.ModelViewSet):
         course = Course.objects.get(pk=course_id)
         if not can_manage(self.request.user, course): raise PermissionDenied("Instructor access required")
         obj = serializer.save(course=course); audit(self.request, "assignment.created", str(obj.id))
+    def perform_destroy(self, instance):
+        if not can_manage(self.request.user, instance.course): raise PermissionDenied("Instructor access required")
+        assignment_id = instance.id
+        submission_files = list(instance.submissions.exclude(file="").values_list("file", flat=True))
+        submission_count = instance.submissions.count()
+        instance.delete()
+        failed_file_deletions = 0
+        for file_name in submission_files:
+            try: default_storage.delete(file_name)
+            except Exception: failed_file_deletions += 1
+        audit(self.request, "assignment.deleted", str(assignment_id), submissions=submission_count, failed_file_deletions=failed_file_deletions)
 
 class SubmissionViewSet(viewsets.ModelViewSet):
     serializer_class, queryset = SubmissionSerializer, Submission.objects.select_related("assignment", "student")

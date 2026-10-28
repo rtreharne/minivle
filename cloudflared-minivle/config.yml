@@ -1,0 +1,6 @@
+tunnel: 3b38d2a1-7628-4bd0-bc5d-ac53755644af
+credentials-file: /etc/cloudflared/credentials.json
+ingress:
+  - hostname: demo.minivle.com
+    service: http://web:8000
+  - service: http_status:404

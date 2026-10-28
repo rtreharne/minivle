@@ -94,6 +94,15 @@ class LtiDeployment(Timestamped):
     class Meta:
         constraints = [models.UniqueConstraint(fields=["tool", "course"], name="unique_lti_tool_course_deployment")]
 
+class LtiServiceToken(models.Model):
+    tool = models.ForeignKey(LtiTool, on_delete=models.CASCADE, related_name="service_tokens")
+    deployment = models.ForeignKey(LtiDeployment, on_delete=models.CASCADE, related_name="service_tokens")
+    token_hash = models.CharField(max_length=64, unique=True)
+    assertion_jti = models.CharField(max_length=255, unique=True)
+    scopes = models.JSONField(default=list)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
 class AuditEvent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     actor = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)

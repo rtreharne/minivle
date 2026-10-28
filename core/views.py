@@ -10,6 +10,7 @@ from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
+from django.core.files.storage import default_storage
 from django.db import transaction
 from django.db.models import Max, Q
 from django.http import Http404
@@ -218,6 +219,27 @@ def assignment_detail(request, course_id, assignment_id):
     assignment = get_object_or_404(Assignment, pk=assignment_id, course=course)
     preview = student_preview_active(request, course)
     manager = can_manage(request.user, course) and not preview
+    if request.method == "POST" and request.POST.get("action") == "delete":
+        if not manager:
+            raise Http404
+        assignment_title = assignment.title
+        assignment_id = assignment.id
+        submission_files = list(assignment.submissions.exclude(file="").values_list("file", flat=True))
+        submission_count = assignment.submissions.count()
+        with transaction.atomic():
+            assignment.delete()
+            audit(request, "assignment.deleted", str(assignment_id), title=assignment_title, submissions=submission_count)
+        failed_file_deletions = 0
+        for file_name in submission_files:
+            try:
+                default_storage.delete(file_name)
+            except Exception:
+                failed_file_deletions += 1
+        if failed_file_deletions:
+            messages.warning(request, f"Assignment deleted with its grades and {submission_count} submission(s), but {failed_file_deletions} uploaded file(s) could not be removed from storage.")
+        else:
+            messages.success(request, f"Assignment deleted with its grades and {submission_count} submission(s).")
+        return redirect("assignments", course_id=course.id)
     if request.method == "POST" and not manager:
         form = SubmissionForm(request.POST, request.FILES)
         if form.is_valid():
