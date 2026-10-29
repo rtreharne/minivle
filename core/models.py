@@ -118,6 +118,12 @@ class UserProfile(Timestamped):
     is_platform_admin = models.BooleanField(default=False)
     def __str__(self): return self.user.username
 
+class BrandSettings(models.Model):
+    logo = models.FileField(upload_to="branding/", blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self): return "Brand settings"
+
 class EmailVerificationToken(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="verification_tokens")
     token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)

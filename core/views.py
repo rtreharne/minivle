@@ -1,7 +1,9 @@
 import json
+import os
 import secrets
 import hashlib
 import hmac
+import boto3
 from datetime import timedelta
 from urllib.request import Request, urlopen
 from django.conf import settings
@@ -13,13 +15,14 @@ from django.core.mail import send_mail
 from django.core.files.storage import default_storage
 from django.db import transaction
 from django.db.models import Max, Q
-from django.http import Http404
+from django.http import Http404, FileResponse
+from django.views.decorators.cache import never_cache
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from .api import audit
 from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiNavigationLabelForm, LtiRegistrationForm, LtiToolForm, PlacementConfigurationForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
-from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
+from .models import Assignment, AuditEvent, BrandSettings, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
 from .network import server_fetch_url
 from .permissions import can_manage, course_role, enrolled_or_404, is_platform_admin, student_preview_active
 
@@ -428,11 +431,34 @@ def platform_lti_detail(request, tool_id):
 @platform_admin_required
 def platform_people(request):
     query, state = request.GET.get("q", ""), request.GET.get("state", "")
-    people = User.objects.select_related("profile").order_by("first_name", "username")
+    people = User.objects.select_related("profile").order_by("last_name", "first_name", "username")
     if query: people = people.filter(Q(username__icontains=query) | Q(email__icontains=query) | Q(first_name__icontains=query) | Q(last_name__icontains=query))
     if state == "pending": people = people.filter(is_active=False)
     if state == "admins": people = people.filter(profile__is_platform_admin=True)
     return render(request, "core/platform/people.html", {"people": people, "query": query, "state": state})
+
+@platform_admin_required
+@never_cache
+def platform_theme(request):
+    settings_obj = BrandSettings.objects.first() or BrandSettings.objects.create()
+    if request.method == "POST" and request.FILES.get("logo"):
+        # SeaweedFS does not create the configured bucket until it is used.
+        # Ensure it exists before Django's S3 storage saves the uploaded logo.
+        bucket = os.getenv("AWS_STORAGE_BUCKET_NAME")
+        if bucket:
+            storage_client = boto3.client("s3", endpoint_url=os.getenv("AWS_S3_ENDPOINT_URL"), aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"), region_name=os.getenv("AWS_S3_REGION_NAME", "us-east-1"))
+            try: storage_client.head_bucket(Bucket=bucket)
+            except Exception: storage_client.create_bucket(Bucket=bucket)
+        settings_obj.logo = request.FILES["logo"]
+        settings_obj.save()
+        messages.success(request, "Logo uploaded.")
+        return redirect("platform-theme")
+    return render(request, "core/platform/theme.html", {"brand_settings": settings_obj})
+
+def brand_logo(request):
+    settings_obj = BrandSettings.objects.first()
+    if not settings_obj or not settings_obj.logo: raise Http404
+    return FileResponse(settings_obj.logo.open("rb"), content_type="image/*")
 
 @platform_admin_required
 def platform_person(request, user_id):

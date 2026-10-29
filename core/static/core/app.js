@@ -1,4 +1,6 @@
 (() => {
+  const savedTheme = localStorage.getItem('minivle-theme') || 'charcoal';
+  document.documentElement.dataset.theme = savedTheme;
   document.querySelectorAll('.toast').forEach((toast) => {
     window.setTimeout(() => toast.classList.add('is-hidden'), 4500);
   });
@@ -64,4 +66,24 @@
     });
     updateCount();
   }
+  const peopleTable = document.querySelector('[data-people-table]');
+  if (peopleTable) {
+    const body = peopleTable.tBodies[0];
+    const rows = () => Array.from(body.querySelectorAll('[data-people-row]'));
+    peopleTable.querySelector('[data-people-sort]').addEventListener('click', (buttonEvent) => {
+      const button = buttonEvent.currentTarget;
+      const direction = button.getAttribute('aria-sort') === 'ascending' ? -1 : 1;
+      rows().sort((a, b) => direction * a.dataset.name.localeCompare(b.dataset.name, undefined, { sensitivity: 'base' })).forEach((row) => body.append(row));
+      button.setAttribute('aria-sort', direction === 1 ? 'ascending' : 'descending');
+    });
+  }
+  document.querySelectorAll('[data-theme-choice]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.themeChoice === savedTheme));
+    button.addEventListener('click', () => {
+      const theme = button.dataset.themeChoice;
+      localStorage.setItem('minivle-theme', theme);
+      document.documentElement.dataset.theme = theme;
+      document.querySelectorAll('[data-theme-choice]').forEach((item) => item.setAttribute('aria-pressed', String(item.dataset.themeChoice === theme)));
+    });
+  });
 })();

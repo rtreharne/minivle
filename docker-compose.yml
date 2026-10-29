@@ -27,7 +27,8 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - lti_secrets:/run/secrets:ro
-      - ./core/static:/app/core/static:ro
+      # Keep application code, templates, and static assets live in development.
+      - ./core:/app/core:ro
   cloudflared:
     image: cloudflare/cloudflared:2026.3.0
     user: "1000:1000"

@@ -14,7 +14,7 @@ router.register("placements", api.PlacementViewSet, basename="placement")
 router.register("audit-events", api.AuditEventViewSet, basename="audit-event")
 router.register("platform/people", api.PlatformUserViewSet, basename="platform-person")
 
-urlpatterns = [
+urlpatterns = [path("branding/logo/", views.brand_logo, name="brand-logo"), path("platform/theme/", views.platform_theme, name="platform-theme"),
     path("docs/lti/", views.lti_developer_docs, name="lti-docs"),
     path("docs/lti/<slug:section>/", views.lti_developer_docs, name="lti-docs-section"),
     path("login/", auth_views.LoginView.as_view(template_name="core/auth/login.html"), name="login"), path("register/", views.register, name="register"), path("verify/<uuid:token>/", views.verify_email, name="verify-email"), path("verify/resend/", views.resend_verification, name="resend-verification"), path("logout/", views.sign_out, name="logout"), path("account/", views.account, name="account"),
