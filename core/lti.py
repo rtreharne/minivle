@@ -58,6 +58,8 @@ def signed_platform_token(tool, deployment, course, user, nonce, message_type, a
         LTI_ROLES: lti13_roles(user, course, as_student=as_student),
         "name": user.get_full_name() or user.username, "email": user.email,
     }
+    if user.profile.sis_login_id:
+        base["sis_login_id"] = user.profile.sis_login_id
     if LTI_NRPS_SCOPE in (tool.scopes or []):
         base[LTI_NRPS_CLAIM] = {
             "context_memberships_url": f"{settings.LTI_ISSUER}/lti/nrps/{course.id}/memberships",
@@ -315,8 +317,21 @@ def nrps(request, course_id):
         role_name = role_names.get(enrollment.role, "Member")
         if role_filter and role_filter.lower() not in {role_name.lower(), enrollment.role.lower()}:
             continue
-        members.append({"user_id": str(enrollment.user_id), "name": enrollment.user.get_full_name() or enrollment.user.username,
-                        "roles": [f"http://purl.imsglobal.org/vocab/lis/v2/membership#{role_name}"], "status": "Active"})
+        profile = enrollment.user.profile
+        member = {
+            "user_id": str(enrollment.user_id),
+            "name": enrollment.user.get_full_name() or enrollment.user.username,
+            "roles": [f"http://purl.imsglobal.org/vocab/lis/v2/membership#{role_name}"],
+            "status": "Active",
+        }
+        if profile.sis_login_id:
+            # NRPS's standard sourced ID field plus a named MiniVLE extension.
+            member["lis_person_sourcedid"] = profile.sis_login_id
+            member["sis_login_id"] = profile.sis_login_id
+        if profile.student_id:
+            # MiniVLE's nine-digit learner number is what the paper bubbles encode.
+            member["student_id"] = profile.student_id
+        members.append(member)
     try:
         limit = max(1, min(int(request.GET.get("limit", "100")), 1000))
         offset = max(0, int(request.GET.get("offset", "0")))
