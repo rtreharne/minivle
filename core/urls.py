@@ -1,7 +1,7 @@
 from django.urls import include, path
 from django.contrib.auth import views as auth_views
 from rest_framework.routers import DefaultRouter
-from . import api, lti, views
+from . import api, canvas_api, lti, views
 
 router = DefaultRouter()
 router.register("courses", api.CourseViewSet, basename="course")
@@ -17,16 +17,36 @@ router.register("platform/people", api.PlatformUserViewSet, basename="platform-p
 urlpatterns = [path("branding/logo/", views.brand_logo, name="brand-logo"), path("platform/theme/", views.platform_theme, name="platform-theme"),
     path("docs/lti/", views.lti_developer_docs, name="lti-docs"),
     path("docs/lti/<slug:section>/", views.lti_developer_docs, name="lti-docs-section"),
+    path("docs/api/", views.public_api_docs, name="api-docs"),
     path("login/", auth_views.LoginView.as_view(template_name="core/auth/login.html"), name="login"), path("register/", views.register, name="register"), path("verify/<uuid:token>/", views.verify_email, name="verify-email"), path("verify/resend/", views.resend_verification, name="resend-verification"), path("logout/", views.sign_out, name="logout"), path("account/", views.account, name="account"),
     path("platform/masquerade/<int:user_id>/", views.start_student_masquerade, name="masquerade-start"), path("platform/masquerade/stop/", views.stop_masquerade, name="masquerade-stop"),
     path("", views.dashboard, name="dashboard"), path("courses/<int:course_id>/", views.course_home, name="course-home"), path("courses/<int:course_id>/tools/<int:placement_id>/", views.course_tool, name="course-tool"),
     path("courses/<int:course_id>/student-preview/", views.toggle_student_preview, name="student-preview"),
     path("courses/<int:course_id>/roster/", views.roster, name="roster"), path("courses/<int:course_id>/assignments/", views.assignments, name="assignments"),
     path("courses/<int:course_id>/assignments/<int:assignment_id>/", views.assignment_detail, name="course-assignment-detail"),
+    path("courses/<int:course_id>/assignments/<int:assignment_id>/rubric/", views.assignment_rubric, name="assignment-rubric"),
     path("courses/<int:course_id>/assignments/<int:assignment_id>/students/<int:student_id>/grade/", views.grade_submission, name="grade-submission"),
     path("courses/<int:course_id>/grades/", views.grades, name="grades"), path("courses/<int:course_id>/lti-tools/", views.lti_tools, name="lti-tools"), path("courses/<int:course_id>/lti-tools/add/", views.add_lti_tool, name="add-lti-tool"), path("courses/<int:course_id>/lti-tools/<int:placement_id>/", views.configure_lti_placement, name="configure-lti-placement"),
     path("platform/", views.platform_dashboard, name="platform-dashboard"), path("platform/lti/", views.platform_lti, name="platform-lti"), path("platform/lti/<int:tool_id>/", views.platform_lti_detail, name="platform-lti-detail"), path("platform/people/", views.platform_people, name="platform-people"), path("platform/people/<int:user_id>/", views.platform_person, name="platform-person"), path("platform/courses/", views.platform_courses, name="platform-courses"), path("platform/courses/<int:course_id>/", views.platform_course, name="platform-course"), path("platform/audit/", views.platform_audit, name="platform-audit"),
     path("api/v1/", include(router.urls)),
+    path("api/v1/courses", canvas_api.courses, name="canvas-courses"),
+    path("api/v1/users/self", canvas_api.current_user, name="canvas-current-user"),
+    path("api/v1/courses/<int:course_id>/assignments", canvas_api.assignments, name="canvas-assignments"),
+    path("api/v1/courses/<int:course_id>/students/submissions", canvas_api.course_student_submissions, name="canvas-course-student-submissions"),
+    path("api/v1/courses/<int:course_id>/assignments/<int:assignment_id>", canvas_api.assignment_detail, name="canvas-assignment-detail"),
+    path("api/v1/courses/<int:course_id>/assignments/<int:assignment_id>/submissions", canvas_api.assignment_submissions, name="canvas-assignment-submissions"),
+    path("api/v1/courses/<int:course_id>/assignments/<int:assignment_id>/submissions/<str:user_id>/files", canvas_api.submission_file_upload, name="canvas-submission-file-upload"),
+    path("api/v1/canvas-upload/<str:upload_token>", canvas_api.canvas_upload_receiver, name="canvas-upload-receiver"),
+    path("api/v1/canvas-upload/<int:submission_id>/complete", canvas_api.canvas_upload_complete, name="canvas-upload-complete"),
+    path("api/v1/courses/<int:course_id>/assignments/<int:assignment_id>/submissions/<str:user_id>", canvas_api.assignment_submissions, name="canvas-assignment-submission"),
+    path("api/v1/courses/<int:course_id>/assignments/<int:assignment_id>/submissions/<str:user_id>/history", canvas_api.submission_history, name="canvas-submission-history"),
+    path("api/v1/courses/<int:course_id>/rubrics", canvas_api.course_rubrics, name="canvas-rubrics"),
+    path("api/v1/courses/<int:course_id>/rubrics/<int:rubric_id>", canvas_api.rubric_detail, name="canvas-rubric-detail"),
+    path("api/v1/courses/<int:course_id>/rubrics/<int:rubric_id>/used_locations", canvas_api.rubric_used_locations, name="canvas-rubric-used-locations"),
+    path("api/v1/courses/<int:course_id>/rubric_associations", canvas_api.rubric_associations, name="canvas-rubric-associations"),
+    path("api/v1/courses/<int:course_id>/rubric_associations/<int:association_id>", canvas_api.rubric_associations, name="canvas-rubric-association"),
+    path("api/v1/courses/<int:course_id>/rubric_associations/<int:association_id>/rubric_assessments", canvas_api.rubric_assessments, name="canvas-rubric-assessments"),
+    path("api/v1/courses/<int:course_id>/rubric_associations/<int:association_id>/rubric_assessments/<int:assessment_id>", canvas_api.rubric_assessments, name="canvas-rubric-assessment"),
     path("api/v1/submission-uploads/presign/", api.presign_submission, name="presign-submission"), path("api/v1/submission-uploads/finalize/", api.finalize_submission, name="finalize-submission"),
     path("lti/jwks/", lti.jwks, name="lti-jwks"), path("lti/token/", lti.lti_service_token, name="lti-service-token"), path("lti/oidc/login/", lti.oidc_login, name="lti-oidc-login"), path("lti/authorize/", lti.lti13_authorize, name="lti13-authorize"), path("lti/launch/", lti.lti13_launch, name="lti13-launch"),
     path("lti/placements/<int:placement_id>/launch/", lti.lti13_start, name="lti13-start"),

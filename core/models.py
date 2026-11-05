@@ -75,6 +75,7 @@ class LtiTool(Timestamped):
     oidc_initiation_url = models.URLField(blank=True)
     deployment_registration_url = models.URLField(blank=True)
     scopes = models.JSONField(default=list, blank=True)
+    api_scopes = models.JSONField(default=list, blank=True)
     active = models.BooleanField(default=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     def __str__(self): return self.name
@@ -99,8 +100,62 @@ class LtiServiceToken(models.Model):
     deployment = models.ForeignKey(LtiDeployment, on_delete=models.CASCADE, related_name="service_tokens")
     token_hash = models.CharField(max_length=64, unique=True)
     assertion_jti = models.CharField(max_length=255, unique=True)
+    launch_jti = models.CharField(max_length=255, unique=True, null=True, blank=True)
     scopes = models.JSONField(default=list)
+    course_ids = models.JSONField(default=list)
+    is_platform_admin = models.BooleanField(default=False)
+    launch_role = models.CharField(max_length=16, default="student")
     expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="lti_service_tokens")
+    launch_course = models.ForeignKey(Course, null=True, blank=True, on_delete=models.CASCADE, related_name="lti_service_tokens")
+
+class Rubric(Timestamped):
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name="rubrics")
+    title = models.CharField(max_length=255)
+    free_form_criterion_comments = models.BooleanField(default=False)
+    hide_score_total = models.BooleanField(default=False)
+    reusable = models.BooleanField(default=False)
+
+class RubricCriterion(models.Model):
+    rubric = models.ForeignKey(Rubric, on_delete=models.CASCADE, related_name="criteria")
+    criterion_id = models.CharField(max_length=80)
+    description = models.CharField(max_length=255)
+    long_description = models.TextField(blank=True)
+    points = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    ratings = models.JSONField(default=list, blank=True)
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["rubric", "criterion_id"], name="unique_rubric_criterion")]
+
+class RubricAssociation(Timestamped):
+    rubric = models.ForeignKey(Rubric, on_delete=models.CASCADE, related_name="associations")
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name="rubric_associations")
+    assignment = models.ForeignKey(Assignment, null=True, blank=True, on_delete=models.CASCADE, related_name="rubric_associations")
+    use_for_grading = models.BooleanField(default=False)
+    hide_score_total = models.BooleanField(default=False)
+    purpose = models.CharField(max_length=32, default="grading")
+
+class RubricAssessment(Timestamped):
+    association = models.ForeignKey(RubricAssociation, on_delete=models.CASCADE, related_name="assessments")
+    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="rubric_assessments")
+    assessor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="rubric_assessments_given")
+    assessment_type = models.CharField(max_length=32, default="grading")
+    score = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    data = models.JSONField(default=dict, blank=True)
+    comments = models.TextField(blank=True)
+    provisional = models.BooleanField(default=False)
+    final = models.BooleanField(default=False)
+    graded_anonymously = models.BooleanField(default=False)
+
+class CanvasUploadGrant(models.Model):
+    token_hash = models.CharField(max_length=64, unique=True)
+    assignment = models.ForeignKey(Assignment, on_delete=models.CASCADE, related_name="canvas_upload_grants")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="canvas_upload_grants")
+    filename = models.CharField(max_length=255)
+    size = models.PositiveBigIntegerField()
+    content_type = models.CharField(max_length=255, default="application/octet-stream")
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 class AuditEvent(models.Model):

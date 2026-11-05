@@ -21,8 +21,8 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from .api import audit
-from .forms import AssignmentForm, CourseForm, GradeForm, LtiConfigImportForm, LtiDeploymentForm, LtiNavigationLabelForm, LtiRegistrationForm, LtiToolForm, PlacementConfigurationForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
-from .models import Assignment, AuditEvent, BrandSettings, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
+from .forms import AssignmentForm, CourseForm, GradeForm, LtiApiScopesForm, LtiConfigImportForm, LtiDeploymentForm, LtiNavigationLabelForm, LtiRegistrationForm, LtiToolForm, PlacementConfigurationForm, ProfileForm, RegistrationForm, SubmissionForm, ToolPlacementForm
+from .models import Assignment, AuditEvent, BrandSettings, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Rubric, RubricAssociation, Submission, ToolPlacement
 from .network import server_fetch_url
 from .permissions import can_manage, course_role, enrolled_or_404, is_platform_admin, student_preview_active
 
@@ -99,6 +99,12 @@ def lti_developer_docs(request, section="overview"):
     return render(request, "core/docs/lti.html", {
         "section": section, "section_title": sections[section][0],
         "section_label": sections[section][1], "origin": origin,
+    })
+
+def public_api_docs(request):
+    """Public reference for the launch-bound Canvas-shaped API."""
+    return render(request, "core/docs/api.html", {
+        "origin": f"{request.scheme}://{request.get_host()}",
     })
 
 @login_required
@@ -254,7 +260,52 @@ def assignment_detail(request, course_id, assignment_id):
     submissions = assignment.submissions.filter(student=request.user) if not manager else assignment.submissions.select_related("student")
     grade = Grade.objects.filter(assignment=assignment, student=request.user).first()
     lti_placement = ToolPlacement.objects.filter(course=course, assignment=assignment, tool__lti_version="1.3", tool__active=True).first()
-    return render(request, "core/assignment_detail.html", {"course": course, "assignment": assignment, "form": form, "submissions": submissions, "grade": grade, "can_manage": manager, "preview": preview, "lti_placement": lti_placement})
+    rubric_association = assignment.rubric_associations.select_related("rubric").prefetch_related("rubric__criteria").first()
+    return render(request, "core/assignment_detail.html", {"course": course, "assignment": assignment, "form": form, "submissions": submissions, "grade": grade, "can_manage": manager, "preview": preview, "lti_placement": lti_placement, "rubric_association": rubric_association})
+
+@login_required
+def assignment_rubric(request, course_id, assignment_id):
+    course = enrolled_or_404(request.user, get_object_or_404(Course, pk=course_id))
+    assignment = get_object_or_404(Assignment, pk=assignment_id, course=course)
+    manager = can_manage(request.user, course) and not student_preview_active(request, course)
+    if not manager: raise Http404
+    association = assignment.rubric_associations.select_related("rubric").prefetch_related("rubric__criteria").first()
+    rubric = association.rubric if association else None
+    if request.method == "POST":
+        title = request.POST.get("title", "").strip()
+        descriptions = request.POST.getlist("criterion_description")
+        details = request.POST.getlist("criterion_detail")
+        point_values = request.POST.getlist("criterion_points")
+        criteria = []
+        try:
+            for index, description in enumerate(descriptions):
+                description = description.strip()
+                if not description: continue
+                points = float(point_values[index])
+                if points < 0: raise ValueError
+                criteria.append((description, details[index].strip() if index < len(details) else "", points))
+        except (ValueError, IndexError):
+            messages.error(request, "Enter a valid non-negative point value for each criterion.")
+        else:
+            if not title or not criteria:
+                messages.error(request, "A rubric needs a title and at least one criterion.")
+            else:
+                if not rubric:
+                    rubric = Rubric.objects.create(course=course, title=title)
+                    association = RubricAssociation.objects.create(rubric=rubric, course=course, assignment=assignment, use_for_grading=True, purpose="grading")
+                else:
+                    rubric.title = title
+                    rubric.save(update_fields=["title", "updated_at"])
+                rubric.criteria.all().delete()
+                for index, (description, detail, points) in enumerate(criteria, 1):
+                    rubric.criteria.create(criterion_id=f"criterion_{index}", description=description, long_description=detail, points=points,
+                        ratings=[{"description":"Exceeds expectations","points":points},{"description":"Meets expectations","points":round(points*.8,2)},{"description":"Developing","points":round(points*.6,2)},{"description":"Beginning","points":0}])
+                if association and not association.use_for_grading:
+                    association.use_for_grading = True
+                    association.save(update_fields=["use_for_grading", "updated_at"])
+                messages.success(request, "Rubric saved.")
+                return redirect("course-assignment-detail", course_id=course.id, assignment_id=assignment.id)
+    return render(request, "core/rubric_editor.html", {"course": course, "assignment": assignment, "rubric": rubric, "criteria": rubric.criteria.all() if rubric else range(4)})
 
 @login_required
 def grades(request, course_id):
@@ -383,6 +434,7 @@ def platform_lti_detail(request, tool_id):
     tool = get_object_or_404(LtiTool, pk=tool_id, lti_version="1.3")
     deployment_form = LtiDeploymentForm()
     navigation_form = LtiNavigationLabelForm(instance=tool)
+    api_scopes_form = LtiApiScopesForm(instance=tool)
     if request.method == "POST":
         if request.POST.get("action") == "delete":
             if request.POST.get("confirm_delete") != "on":
@@ -400,6 +452,13 @@ def platform_lti_detail(request, tool_id):
             tool.active = not tool.active; tool.save(update_fields=["active", "updated_at"])
             audit(request, "lti13.registration_toggled", str(tool.id), active=tool.active)
             return redirect(request.path)
+        if request.POST.get("action") == "api-scopes":
+            api_scopes_form = LtiApiScopesForm(request.POST, instance=tool)
+            if api_scopes_form.is_valid():
+                api_scopes_form.save()
+                audit(request, "lti13.api_scopes_updated", str(tool.id), scopes=tool.api_scopes)
+                messages.success(request, "Canvas-compatible API scopes updated.")
+                return redirect(request.path)
         if request.POST.get("action") == "navigation-label":
             navigation_form = LtiNavigationLabelForm(request.POST, instance=tool)
             if navigation_form.is_valid():
@@ -421,12 +480,12 @@ def platform_lti_detail(request, tool_id):
             except (OSError, ValueError) as error:
                 if created: deployment.delete()
                 deployment_form.add_error(None, f"Could not register this deployment with the tool: {error}")
-                return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form, "navigation_form": navigation_form})
+                return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form, "navigation_form": navigation_form, "api_scopes_form": api_scopes_form})
             audit(request, "lti13.deployment_created", str(deployment.id), course=deployment.course_id, deployment_id=deployment.deployment_id)
             messages.success(request, "LTI deployment is ready. Add a course placement from the course LTI tools page.")
             return redirect(request.path)
     deployment_form.fields["course"].queryset = Course.objects.filter(is_archived=False)
-    return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form, "navigation_form": navigation_form})
+    return render(request, "core/platform/lti_detail.html", {"tool": tool, "deployments": tool.deployments.select_related("course"), "deployment_form": deployment_form, "navigation_form": navigation_form, "api_scopes_form": api_scopes_form})
 
 @platform_admin_required
 def platform_people(request):

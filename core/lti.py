@@ -18,7 +18,7 @@ from django.views.decorators.csrf import csrf_exempt
 from oauthlib.oauth1 import Client, SIGNATURE_TYPE_BODY, RequestValidator, SignatureOnlyEndpoint
 from oauth2_provider.decorators import protected_resource
 from .api import audit
-from .models import Assignment, AuditEvent, Grade, LtiDeployment, LtiServiceToken, LtiTool, ToolPlacement
+from .models import Assignment, AuditEvent, CanvasUploadGrant, Course, Enrollment, Grade, LtiDeployment, LtiServiceToken, LtiTool, ToolPlacement
 from .permissions import can_manage, course_role, is_platform_admin, student_preview_active
 
 LTI_VERSION = "https://purl.imsglobal.org/spec/lti/claim/version"
@@ -52,7 +52,7 @@ def lti13_hint(payload):
 def signed_platform_token(tool, deployment, course, user, nonce, message_type, as_student=False, **claims):
     now = int(time.time())
     base = {
-        "iss": settings.LTI_ISSUER, "aud": tool.client_id, "sub": str(user.pk), "iat": now, "exp": now + 300, "nonce": nonce,
+        "iss": settings.LTI_ISSUER, "aud": tool.client_id, "sub": str(user.pk), "iat": now, "exp": now + 300, "nonce": nonce, "jti": uuid.uuid4().hex,
         LTI_VERSION: "1.3.0", LTI_DEPLOYMENT: deployment.deployment_id, LTI_MESSAGE_TYPE: message_type,
         LTI_CONTEXT: {"id": str(course.id), "label": course.code, "title": course.title},
         LTI_ROLES: lti13_roles(user, course, as_student=as_student),
@@ -290,6 +290,7 @@ def lti13_launch(request):
     if not role: return HttpResponseBadRequest("User is not enrolled")
     now = int(time.time())
     claims = {"iss": settings.LTI_ISSUER, "aud": tool.client_id, "sub": str(request.user.pk), "iat": now, "exp": now + 300, "nonce": data["nonce"],
+        "jti": uuid.uuid4().hex,
         "https://purl.imsglobal.org/spec/lti/claim/version": "1.3.0", "https://purl.imsglobal.org/spec/lti/claim/deployment_id": tool.deployment_id,
         "https://purl.imsglobal.org/spec/lti/claim/message_type": "LtiResourceLinkRequest", "https://purl.imsglobal.org/spec/lti/claim/target_link_uri": data["target"],
         "https://purl.imsglobal.org/spec/lti/claim/context": {"id": str(placement.course_id), "label": placement.course.code, "title": placement.course.title},
@@ -353,11 +354,12 @@ def nrps(request, course_id):
 @csrf_exempt
 @require_POST
 def lti_service_token(request):
-    """Issue short-lived NRPS access tokens using the LTI client-credentials flow."""
+    """Issue short-lived LTI Advantage or launch-bound Canvas-compatible API tokens."""
     if request.POST.get("grant_type") != "client_credentials" or request.POST.get("client_assertion_type") != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer":
         return JsonResponse({"error": "unsupported_grant_type"}, status=400)
     requested_scopes = request.POST.get("scope", "").split()
-    if not requested_scopes or any(scope != LTI_NRPS_SCOPE for scope in requested_scopes):
+    api_token_request = any(scope.startswith("url:") for scope in requested_scopes)
+    if not requested_scopes or any(scope != LTI_NRPS_SCOPE and not scope.startswith("url:") for scope in requested_scopes):
         return JsonResponse({"error": "invalid_scope"}, status=400)
     assertion = request.POST.get("client_assertion", "")
     try:
@@ -367,7 +369,7 @@ def lti_service_token(request):
         if not client_id or unverified.get("sub") != client_id or not unverified.get("jti"):
             raise ValueError("Invalid client assertion claims.")
         tool = LtiTool.objects.filter(client_id=client_id, lti_version="1.3", active=True).first()
-        if not tool or LTI_NRPS_SCOPE not in (tool.scopes or []) or not tool.jwks_url:
+        if not tool or not tool.jwks_url or (LTI_NRPS_SCOPE in requested_scopes and LTI_NRPS_SCOPE not in (tool.scopes or [])):
             raise ValueError("Unknown tool client.")
         with urlopen(server_fetch_url(tool.jwks_url), timeout=5) as response:
             keys = json.load(response).get("keys", [])
@@ -385,13 +387,61 @@ def lti_service_token(request):
             raise ValueError("Unknown LTI deployment.")
         if LtiServiceToken.objects.filter(assertion_jti=claims["jti"]).exists():
             raise ValueError("Client assertion has already been used.")
+        user = launch_course = None
+        launch_jti = None
+        course_ids = []
+        platform_admin = False
+        launch_role = "student"
+        if api_token_request:
+            allowed = set(tool.api_scopes or [])
+            requested_api_scopes = {scope for scope in requested_scopes if scope.startswith("url:")}
+            if not requested_api_scopes.issubset(allowed):
+                return JsonResponse({"error": "invalid_scope"}, status=400)
+            launch_token = request.POST.get("launch_token", "")
+            from cryptography.hazmat.primitives import serialization
+            platform_public_key = serialization.load_pem_private_key(settings.LTI_PRIVATE_KEY.encode(), password=None).public_key()
+            launch_claims = jwt.decode(launch_token, platform_public_key, algorithms=["RS256"], audience=tool.client_id,
+                                       options={"require": ["iss", "sub", "aud", "iat", "exp", "jti"]})
+            if launch_claims.get("iss") != settings.LTI_ISSUER or launch_claims.get(LTI_MESSAGE_TYPE) != "LtiResourceLinkRequest":
+                raise ValueError("Invalid LTI launch context.")
+            if launch_claims.get(LTI_DEPLOYMENT) != deployment.deployment_id:
+                raise ValueError("Launch deployment does not match client assertion.")
+            launch_jti = launch_claims["jti"]
+            if LtiServiceToken.objects.filter(launch_jti=launch_jti).exists():
+                raise ValueError("LTI launch context has already been exchanged.")
+            user = get_user_model().objects.get(pk=launch_claims["sub"], is_active=True)
+            context_id = launch_claims.get(LTI_CONTEXT, {}).get("id")
+            launch_course = Course.objects.filter(pk=int(context_id), id=deployment.course_id).first()
+            if not launch_course:
+                raise ValueError("Launch course does not match deployment.")
+            if not Enrollment.objects.filter(user=user, course=launch_course, active=True).exists() and not is_platform_admin(user):
+                raise ValueError("User is no longer enrolled in the launch course.")
+            platform_admin = is_platform_admin(user)
+            launch_role = Enrollment.objects.filter(user=user, course=launch_course, active=True).values_list("role", flat=True).first() or ("admin" if platform_admin else "student")
+            if platform_admin:
+                course_ids = list(Course.objects.values_list("id", flat=True))
+            else:
+                seen, frontier = {launch_course.id}, {launch_course.id}
+                while frontier:
+                    user_ids = Enrollment.objects.filter(course_id__in=frontier, active=True).values_list("user_id", flat=True)
+                    newly_found = set(Enrollment.objects.filter(user_id__in=user_ids, active=True).values_list("course_id", flat=True)) - seen
+                    seen.update(newly_found)
+                    frontier = newly_found
+                course_ids = sorted(seen)
     except Exception:
         return JsonResponse({"error": "invalid_client"}, status=401)
     service_token = secrets.token_urlsafe(40)
-    LtiServiceToken.objects.create(tool=tool, deployment=deployment, token_hash=hashlib.sha256(service_token.encode()).hexdigest(),
+    LtiServiceToken.objects.create(tool=tool, deployment=deployment, user=user, launch_course=launch_course, launch_jti=launch_jti,
+                                   course_ids=course_ids, is_platform_admin=platform_admin, launch_role=launch_role,
+                                   token_hash=hashlib.sha256(service_token.encode()).hexdigest(),
                                    assertion_jti=claims["jti"], scopes=requested_scopes,
                                    expires_at=timezone.now() + timedelta(minutes=5))
+    AuditEvent.objects.create(actor=user, action="lti13.service_token_issued", target=str(tool.id),
+                              metadata={"deployment": deployment.deployment_id, "scopes": requested_scopes,
+                                        "launch_course": launch_course.id if launch_course else deployment.course_id,
+                                        "course_count": len(course_ids)})
     LtiServiceToken.objects.filter(expires_at__lt=timezone.now() - timedelta(days=1)).delete()
+    CanvasUploadGrant.objects.filter(expires_at__lt=timezone.now() - timedelta(days=1)).delete()
     return JsonResponse({"access_token": service_token, "token_type": "Bearer", "expires_in": 300, "scope": " ".join(requested_scopes)}, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 @require_POST

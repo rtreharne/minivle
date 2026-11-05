@@ -93,6 +93,43 @@ Both applications must share `LTI_DEPLOYMENT_SYNC_SECRET`. The checked-in Compos
 - `GET /lti/nrps/{course_id}/memberships` — development roster service
 - `POST /lti/ags/assignments/{assignment_id}/students/{student_id}/score` — development score passback
 
+## Canvas-compatible API for LTI tools
+
+MiniVLE issues launch-bound bearer tokens for the selected Canvas-shaped API routes. A tool requests the `url:<METHOD>|/api/v1/<path>` scopes configured for its registration, using a private-key JWT client assertion and the signed LTI launch `id_token` as `launch_token` in the `POST /lti/token/` client-credentials request. The platform binds the returned five-minute token to that launch's user, deployment, course, approved scopes, and course set. A given launch token can be exchanged only once. NRPS scope may be requested in the same token alongside Canvas API scopes.
+
+Platform administrators configure allowed Canvas API scopes on the LTI registration detail page, one scope per line. These are the implemented method/path scopes:
+
+```text
+url:GET|/api/v1/courses
+url:GET|/api/v1/users/self
+url:GET|/api/v1/courses/:course_id/assignments
+url:POST|/api/v1/courses/:course_id/assignments
+url:GET|/api/v1/courses/:course_id/assignments/:id
+url:PUT|/api/v1/courses/:course_id/assignments/:id
+url:DELETE|/api/v1/courses/:course_id/assignments/:id
+url:GET|/api/v1/courses/:course_id/assignments/:assignment_id/submissions
+url:POST|/api/v1/courses/:course_id/assignments/:assignment_id/submissions
+url:GET|/api/v1/courses/:course_id/assignments/:assignment_id/submissions/:user_id
+url:PUT|/api/v1/courses/:course_id/assignments/:assignment_id/submissions/:user_id
+url:GET|/api/v1/courses/:course_id/assignments/:assignment_id/submissions/:user_id/history
+url:POST|/api/v1/courses/:course_id/assignments/:assignment_id/submissions/:user_id/files
+url:GET|/api/v1/courses/:course_id/students/submissions
+url:GET|/api/v1/courses/:course_id/rubrics
+url:POST|/api/v1/courses/:course_id/rubrics
+url:GET|/api/v1/courses/:course_id/rubrics/:id
+url:PUT|/api/v1/courses/:course_id/rubrics/:id
+url:DELETE|/api/v1/courses/:course_id/rubrics/:id
+url:GET|/api/v1/courses/:course_id/rubrics/:id/used_locations
+url:POST|/api/v1/courses/:course_id/rubric_associations
+url:PUT|/api/v1/courses/:course_id/rubric_associations/:id
+url:DELETE|/api/v1/courses/:course_id/rubric_associations/:id
+url:POST|/api/v1/courses/:course_id/rubric_associations/:rubric_association_id/rubric_assessments
+url:PUT|/api/v1/courses/:course_id/rubric_associations/:rubric_association_id/rubric_assessments/:id
+url:DELETE|/api/v1/courses/:course_id/rubric_associations/:rubric_association_id/rubric_assessments/:id
+```
+
+The selected Canvas-shaped routes cover courses, `/users/self`, assignments, assignment submissions and submission history, rubric CRUD, rubric associations, rubric assessments, and rubric used locations. Submission responses expose existing MiniVLE grades. The course list follows active enrollments transitively from the launch course; instructors can read student records throughout that set, learners can read their own records, and platform administrators can access all courses. The API supports Canvas JSON, bracketed form fields, pagination links, and `application/json+canvas-string-ids` responses for supported routes. It does not implement unrelated Canvas API resources or Canvas's user-consent OAuth flow.
+
 Set `LTI_PRIVATE_KEY` (or `LTI_PRIVATE_KEY_FILE`) to a persistent RSA PEM and set `LTI_ISSUER` to the public HTTPS base URL before production LTI testing. Local Docker generates and persists a development key in its `lti_secrets` named volume; do not use that development key in production.
 
 ## Tests

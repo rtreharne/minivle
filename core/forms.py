@@ -73,12 +73,33 @@ class PlacementConfigurationForm(forms.ModelForm):
 
 class LtiRegistrationForm(forms.ModelForm):
     scopes = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 3, "placeholder": "One scope per line"}))
+    api_scopes = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 5, "placeholder": "url:GET|/api/v1/courses\nurl:GET|/api/v1/users/self"}))
     class Meta:
         model = LtiTool
-        fields = ["name", "launch_url", "oidc_initiation_url", "jwks_url", "deployment_registration_url", "scopes"]
+        fields = ["name", "launch_url", "oidc_initiation_url", "jwks_url", "deployment_registration_url", "scopes", "api_scopes"]
     def clean_scopes(self):
         value = self.cleaned_data["scopes"]
         return [item.strip() for item in value.splitlines() if item.strip()]
+    def clean_api_scopes(self):
+        value = self.cleaned_data["api_scopes"]
+        scopes = [item.strip() for item in value.splitlines() if item.strip()]
+        import re
+        if any(not re.fullmatch(r"url:(GET|POST|PUT|PATCH|DELETE)\|/api/v1/[A-Za-z0-9_:/-]+", scope) for scope in scopes):
+            raise forms.ValidationError("Scopes must use url:METHOD|/api/v1/Canvas/path format.")
+        return scopes
+
+class LtiApiScopesForm(forms.ModelForm):
+    api_scopes = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 7, "placeholder": "url:GET|/api/v1/courses\nurl:GET|/api/v1/users/self"}))
+    class Meta:
+        model = LtiTool
+        fields = ["api_scopes"]
+    def clean_api_scopes(self):
+        value = self.cleaned_data["api_scopes"]
+        scopes = [item.strip() for item in value.splitlines() if item.strip()]
+        import re
+        if any(not re.fullmatch(r"url:(GET|POST|PUT|PATCH|DELETE)\|/api/v1/[A-Za-z0-9_:/-]+", scope) for scope in scopes):
+            raise forms.ValidationError("Scopes must use url:METHOD|/api/v1/Canvas/path format.")
+        return scopes
 
 class LtiConfigImportForm(forms.Form):
     config_url = forms.URLField(label="Tool configuration URL")

@@ -5,7 +5,18 @@ from django.test import TestCase
 from django.urls import reverse
 from urllib.parse import parse_qs, urlparse
 import jwt
-from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiTool, Submission, ToolPlacement
+from .models import Assignment, AuditEvent, Course, EmailVerificationToken, Enrollment, Grade, LtiDeployment, LtiServiceToken, LtiTool, Rubric, RubricAssociation, RubricAssessment, Submission, ToolPlacement
+import hashlib
+import secrets
+import io
+import json
+from django.utils import timezone
+from datetime import timedelta
+from unittest.mock import patch
+from django.conf import settings
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from jwt.algorithms import RSAAlgorithm
 from .network import server_fetch_url
 from django.test import override_settings
 
@@ -31,6 +42,7 @@ class LearningWorkflowTests(TestCase):
         Enrollment.objects.create(course=self.course, user=self.student, role="student")
         Enrollment.objects.create(course=self.course, user=self.instructor, role="instructor")
         self.assignment = Assignment.objects.create(course=self.course, title="First file", instructions="Upload a PDF", published=True)
+
 
     def test_student_can_submit_versions_and_audit_is_created(self):
         self.client.login(username="learner", password="pass")
@@ -150,6 +162,13 @@ class LearningWorkflowTests(TestCase):
         self.assertContains(response, reverse("lti-oidc-login"))
         self.assertContains(response, reverse("lti13-launch"))
 
+    def test_scoped_api_reference_is_public_and_complete(self):
+        response = self.client.get("/docs/api/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "url:GET|/api/v1/courses")
+        self.assertContains(response, "/rubric_assessments")
+        self.assertContains(response, "launch_token")
+
     def test_lti13_course_placement_creates_a_signed_resource_link_launch(self):
         tool = LtiTool.objects.create(name="Counter", launch_url="http://localhost:8002/lti/launch", oidc_initiation_url="http://localhost:8002/oidc/login", jwks_url="http://localhost:8002/.well-known/jwks.json", lti_version="1.3", client_id="counter-client", active=True)
         LtiDeployment.objects.create(tool=tool, course=self.course, deployment_id="counter-deployment")
@@ -187,3 +206,153 @@ class LearningWorkflowTests(TestCase):
         claims = jwt.decode(token, options={"verify_signature": False})
         self.assertEqual(claims["https://purl.imsglobal.org/spec/lti/claim/message_type"], "LtiDeepLinkingRequest")
         self.assertEqual(claims["https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings"]["accept_types"], ["ltiResourceLink"])
+
+
+class CanvasCompatibleApiTests(TestCase):
+    def setUp(self):
+        self.student = User.objects.create_user("canvas-learner", password="pass")
+        self.teacher = User.objects.create_user("canvas-teacher", password="pass")
+        self.course = Course.objects.create(code="CAN101", title="Canvas API")
+        self.other_course = Course.objects.create(code="CAN102", title="Connected course")
+        Enrollment.objects.create(course=self.course, user=self.student, role="student")
+        Enrollment.objects.create(course=self.course, user=self.teacher, role="instructor")
+        Enrollment.objects.create(course=self.other_course, user=self.student, role="student")
+        self.assignment = Assignment.objects.create(course=self.other_course, title="Essay", instructions="Write", published=True)
+        self.token = secrets.token_urlsafe(32)
+        api_scopes = ["url:GET|/api/v1/courses", "url:GET|/api/v1/users/self", "url:GET|/api/v1/courses/:course_id/assignments",
+                      "url:GET|/api/v1/courses/:course_id/assignments/:assignment_id/submissions",
+                      "url:GET|/api/v1/courses/:course_id/assignments/:assignment_id/submissions/:user_id",
+                      "url:GET|/api/v1/courses/:course_id/students/submissions",
+                      "url:POST|/api/v1/courses/:course_id/assignments/:assignment_id/submissions/:user_id/files",
+                      "url:POST|/api/v1/courses/:course_id/assignments/:assignment_id/submissions"]
+        self.tool = LtiTool.objects.create(name="Canvas API", launch_url="https://tool.test/launch", lti_version="1.3", client_id="canvas-api-client", active=True, api_scopes=api_scopes)
+        self.deployment = LtiDeployment.objects.create(tool=self.tool, course=self.course, deployment_id="canvas-deployment")
+        LtiServiceToken.objects.create(tool=self.tool, deployment=self.deployment, user=self.student, launch_course=self.course,
+            token_hash=hashlib.sha256(self.token.encode()).hexdigest(), assertion_jti="test-assertion", launch_jti="test-launch",
+            scopes=api_scopes,
+            course_ids=[self.course.id, self.other_course.id], expires_at=timezone.now() + timedelta(minutes=5))
+
+    def get_api(self, path):
+        return self.client.get(path, HTTP_AUTHORIZATION=f"Bearer {self.token}")
+
+    def test_token_exchange_binds_launch_user_and_transitive_courses_and_rejects_replay(self):
+        bridge_user = User.objects.create_user("canvas-bridge", password="pass")
+        third_course = Course.objects.create(code="CAN103", title="Three hops")
+        Enrollment.objects.create(course=self.other_course, user=bridge_user, role="instructor")
+        Enrollment.objects.create(course=third_course, user=bridge_user, role="student")
+        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        private_pem = private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        public_jwk = json.loads(RSAAlgorithm.to_jwk(private.public_key()))
+        public_jwk["kid"] = "tool-key"
+        self.tool.jwks_url = "https://tool.test/jwks"
+        self.tool.api_scopes = ["url:GET|/api/v1/courses", "url:GET|/api/v1/users/self"]
+        self.tool.save(update_fields=["jwks_url", "api_scopes"])
+        now = int(timezone.now().timestamp())
+        launch_claims = {"iss": settings.LTI_ISSUER, "aud": self.tool.client_id, "sub": str(self.student.id), "iat": now, "exp": now + 180,
+                         "jti": "launch-exchange-test", "https://purl.imsglobal.org/spec/lti/claim/deployment_id": self.deployment.deployment_id,
+                         "https://purl.imsglobal.org/spec/lti/claim/message_type": "LtiResourceLinkRequest",
+                         "https://purl.imsglobal.org/spec/lti/claim/context": {"id": str(self.course.id)}}
+        launch_token = jwt.encode(launch_claims, settings.LTI_PRIVATE_KEY, algorithm="RS256")
+        def assertion(jti):
+            return jwt.encode({"iss": self.tool.client_id, "sub": self.tool.client_id, "aud": "http://testserver/lti/token/", "iat": now,
+                               "exp": now + 60, "jti": jti,
+                               "https://purl.imsglobal.org/spec/lti/claim/deployment_id": self.deployment.deployment_id}, private_pem,
+                              algorithm="RS256", headers={"kid": "tool-key"})
+        with patch("core.lti.urlopen", return_value=io.BytesIO(json.dumps({"keys": [public_jwk]}).encode())):
+            response = self.client.post("/lti/token/", {"grant_type": "client_credentials", "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": assertion("assertion-first"), "launch_token": launch_token, "scope": "url:GET|/api/v1/courses url:GET|/api/v1/users/self"})
+            self.assertEqual(response.status_code, 200, response.content)
+            issued = LtiServiceToken.objects.get(launch_jti="launch-exchange-test")
+            self.assertEqual(issued.user, self.student)
+            self.assertEqual(set(issued.course_ids), {self.course.id, self.other_course.id, third_course.id})
+            replay = self.client.post("/lti/token/", {"grant_type": "client_credentials", "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": assertion("assertion-second"), "launch_token": launch_token, "scope": "url:GET|/api/v1/courses"})
+            self.assertEqual(replay.status_code, 401)
+
+    def test_scoped_token_reads_current_user_and_reachable_course_assignments(self):
+        self.assertEqual(self.get_api("/api/v1/users/self").json()["id"], self.student.id)
+        courses = self.get_api("/api/v1/courses").json()
+        self.assertEqual({course["id"] for course in courses}, {self.course.id, self.other_course.id})
+        assignments = self.get_api(f"/api/v1/courses/{self.other_course.id}/assignments").json()
+        self.assertEqual(assignments[0]["name"], "Essay")
+
+    def test_scope_and_course_set_are_enforced(self):
+        self.assertEqual(self.client.get(f"/api/v1/courses/{self.other_course.id}/assignments", HTTP_AUTHORIZATION=f"Bearer {self.token}").status_code, 200)
+        unrelated = Course.objects.create(code="CAN999", title="Unrelated")
+        self.assertEqual(self.get_api(f"/api/v1/courses/{unrelated.id}/assignments").status_code, 404)
+        self.assertEqual(self.client.post("/api/v1/courses", HTTP_AUTHORIZATION=f"Bearer {self.token}").status_code, 401)
+        self.tool.api_scopes = ["url:GET|/api/v1/users/self"]
+        self.tool.save(update_fields=["api_scopes"])
+        self.assertEqual(self.get_api(f"/api/v1/courses/{self.other_course.id}/assignments").status_code, 401)
+
+    def test_student_token_cannot_read_another_student_submission(self):
+        other = User.objects.create_user("canvas-other", password="pass")
+        Enrollment.objects.create(course=self.other_course, user=other, role="student")
+        response = self.get_api(f"/api/v1/courses/{self.other_course.id}/assignments/{self.assignment.id}/submissions/{other.id}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_platform_admin_token_can_list_courses_outside_the_launch_graph(self):
+        unrelated = Course.objects.create(code="CAN999", title="Admin-only course")
+        self.student.profile.is_platform_admin = True
+        self.student.profile.save(update_fields=["is_platform_admin", "updated_at"])
+        LtiServiceToken.objects.filter(launch_jti="test-launch").update(is_platform_admin=True, course_ids=[self.course.id, self.other_course.id, unrelated.id])
+        response = self.get_api("/api/v1/courses")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(unrelated.id, {course["id"] for course in response.json()})
+
+    def test_canvas_students_submissions_lists_grades_across_assignments(self):
+        second = Assignment.objects.create(course=self.other_course, title="Quiz", instructions="", published=True)
+        Grade.objects.create(assignment=second, student=self.student, score=8)
+        response = self.get_api(f"/api/v1/courses/{self.other_course.id}/students/submissions?assignment_ids%5B%5D={second.id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+        self.assertEqual(response.json()[0]["score"], 8.0)
+
+    def test_canvas_multipart_submission_file_can_be_finalized_with_file_id(self):
+        upload = self.client.post(f"/api/v1/courses/{self.other_course.id}/assignments/{self.assignment.id}/submissions/{self.student.id}/files",
+            {"file": SimpleUploadedFile("essay.txt", b"work")}, HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.assertEqual(upload.status_code, 201)
+        submitted = self.client.post(f"/api/v1/courses/{self.other_course.id}/assignments/{self.assignment.id}/submissions",
+            {"submission": {"file_ids": [upload.json()["id"]]}}, content_type="application/json", HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.assertEqual(submitted.status_code, 201)
+        self.assertEqual(Submission.objects.filter(assignment=self.assignment, student=self.student).count(), 1)
+
+    def test_canvas_submission_file_upload_handshake(self):
+        from urllib.parse import urlparse
+        init = self.client.post(f"/api/v1/courses/{self.other_course.id}/assignments/{self.assignment.id}/submissions/self/files",
+            {"name": "handshake.txt", "size": "4", "content_type": "text/plain"}, HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.assertEqual(init.status_code, 200)
+        upload_path = urlparse(init.json()["upload_url"]).path
+        uploaded = self.client.post(upload_path, {"file": SimpleUploadedFile("handshake.txt", b"work")})
+        self.assertEqual(uploaded.status_code, 303)
+        complete = self.client.get(uploaded["Location"], HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.assertEqual(complete.status_code, 200)
+        self.assertEqual(complete.json()["filename"], "handshake.txt")
+        replay = self.client.post(upload_path, {"file": SimpleUploadedFile("handshake.txt", b"work")})
+        self.assertEqual(replay.status_code, 403)
+
+    def test_instructor_launch_can_read_students_across_reachable_courses(self):
+        self.token = secrets.token_urlsafe(32)
+        scope = "url:GET|/api/v1/courses/:course_id/assignments/:assignment_id/submissions"
+        self.tool.api_scopes = [scope]
+        self.tool.save(update_fields=["api_scopes"])
+        LtiServiceToken.objects.filter(launch_jti="test-launch").update(user=self.teacher, launch_role="instructor",
+            token_hash=hashlib.sha256(self.token.encode()).hexdigest(), scopes=[scope])
+        response = self.get_api(f"/api/v1/courses/{self.other_course.id}/assignments/{self.assignment.id}/submissions")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["user_id"], self.student.id)
+
+    def test_rubric_assessment_uses_criterion_data(self):
+        self.tool.api_scopes = ["url:POST|/api/v1/courses/:course_id/rubrics", "url:POST|/api/v1/courses/:course_id/rubric_associations/:rubric_association_id/rubric_assessments"]
+        self.tool.save(update_fields=["api_scopes"])
+        LtiServiceToken.objects.filter(launch_jti="test-launch").update(scopes=self.tool.api_scopes)
+        self.token = secrets.token_urlsafe(32)
+        LtiServiceToken.objects.filter(launch_jti="test-launch").update(token_hash=hashlib.sha256(self.token.encode()).hexdigest(), user=self.teacher, launch_role="instructor")
+        rubric_response = self.client.post(f"/api/v1/courses/{self.course.id}/rubrics", {"rubric": {"title": "Essay rubric", "criteria": [{"id": "clarity", "description": "Clarity", "points": 5, "ratings": []}]}}, content_type="application/json", HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.assertEqual(rubric_response.status_code, 201)
+        rubric = Rubric.objects.get()
+        association = RubricAssociation.objects.create(rubric=rubric, course=self.course, assignment=Assignment.objects.create(course=self.course, title="Short", instructions="", published=True))
+        response = self.client.post(f"/api/v1/courses/{self.course.id}/rubric_associations/{association.id}/rubric_assessments", {"rubric_assessment": {"user_id": self.student.id, "score": 4, "data": {"clarity": {"points": 4, "comments": "Clear"}}}}, content_type="application/json", HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.assertEqual(response.status_code, 201)
+        assessment = RubricAssessment.objects.get()
+        self.assertEqual(assessment.data["clarity"]["points"], 4)
